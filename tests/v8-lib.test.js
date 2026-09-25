@@ -224,3 +224,19 @@ test("1ファイル版 dist/V8_all.gs が v8/ と一致し、単体で読み込�
   assert.equal(typeof g.onOpen, "function");
   assert.equal(typeof g.menuImportReceipts, "function");
 });
+
+test("重複行: 別ファイルの同一行のみ。承認済みの行を優先して残す", () => {
+  const row = (id, file, date, amount, o = {}) => ({ id, file_id: file, kind: "カード明細", person: "院長", method: "M-AMEX",
+    orig_date: date, orig_amount: amount, orig_merchant: "スタバ", ...o });
+  const rows = [row("a1", "A", "2026-09-18", 650), row("a2", "A", "2026-09-18", 650),
+    row("b1", "B", "2026-09-18", 650), row("b2", "B", "2026-09-18", 650), row("b3", "B", "2026-09-18", 650),
+    row("c1", "A", "2026-09-19", 650), row("c2", "B", "2026-09-19", 651),
+    row("d1", "A", "2026-09-20", 650), row("d2", "B", "2026-09-20", 650, { orig_merchant: "ｽﾀﾊﾞ" })];
+  const approved = new Set(["b3"]);
+  const dup = arr(gs.findDuplicateStatementRows(rows, t => approved.has(t.id)));
+  assert.deepEqual(Object.keys(dup).sort(), ["b1", "b2", "d2"], "3件残す（B内の最大件数）。承認済みb3→先に取り込んだa1・a2の順");
+  assert.equal(dup.d2, "d1", "半角カナも正規化して同一店とみなす");
+  assert.ok(!dup.c2, "金額が1円でも違えば別取引");
+  const same = [row("x1", "A", "2026-09-18", 650), row("x2", "A", "2026-09-18", 650)];
+  assert.deepEqual(arr(gs.findDuplicateStatementRows(same, () => false)), {}, "同じファイル内の同一行は重複にしない");
+});

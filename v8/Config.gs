@@ -62,6 +62,7 @@ const STATE = {
   NEXT_MONTH:   "翌月確認",
   EXPIRED:      "期限超過",
   FX_CHECK:     "外貨要確認",
+  DUP_ROW:      "重複行",       // 期間が重なる明細ファイルで同じ行が2回取り込まれたもの（突合対象外）
   APPROVED:     "承認済み",
   REJECTED:     "却下",
 };
@@ -98,7 +99,7 @@ const SOURCE_TYPE = {
   STATEMENT: "カード明細",
 };
 
-// 先生＋カード別タブ: 「院長_M-AMEX_レシート」「院長_M-AMEX_明細」「院長_M-AMEX_突合結果」、支払手段不明は「院長_カード不明」
+// 先生＋カード別タブ: 「院長_M-AMEX_突合結果」（レシート｜明細｜結果を横並び）、支払手段不明は「院長_カード不明」。RECEIPT/STATEMENT は旧版タブの片付け用
 const CARD_TAB = { RECEIPT: "レシート", STATEMENT: "明細", RESULT: "突合結果", UNKNOWN: "カード不明" };
 
 // 設定シートの初期値

@@ -426,6 +426,39 @@ function correctionSignature(tx) {
   }));
 }
 
+// ===== 明細の重複行（期間が重なるファイルを両方取り込んだ場合） =====
+
+/**
+ * 別ファイルに同じ行（先生・カード・利用日・金額・店名・外貨額が一致）があるものを重複とみなす。
+ * - 日付や金額が1つでも違えば別の取引（同じ店・同じ月の複数回購入は重複にしない）
+ * - 同じ日・同じ店・同じ金額が本当に複数回ある場合は「1ファイル内の最大件数」までを残す
+ * - 残す行は、承認・個別判断済みの行 → 先に取り込んだ行の順
+ * @return { 重複行の取引ID: 残した行の取引ID }
+ */
+function findDuplicateStatementRows(stmts, isDecided) {
+  const groups = {};
+  stmts.forEach((t, i) => {
+    const e = effective(t);
+    if (!e.date || !isFinite(e.amount)) return;
+    const key = [t.person, t.method, e.date, e.amount, normalizeMerchant(e.merchant),
+      isBlank_(t.foreign_amount) ? "" : Number(t.foreign_amount)].join("|");
+    (groups[key] = groups[key] || []).push({ t, i });
+  });
+  const dupOf = {};
+  Object.values(groups).forEach(rows => {
+    const perFile = {};
+    rows.forEach(({ t }) => { perFile[t.file_id] = (perFile[t.file_id] || 0) + 1; });
+    const files = Object.keys(perFile);
+    if (files.length < 2) return;
+    const keep = Math.max(...files.map(f => perFile[f]));
+    const ordered = rows.slice().sort((a, b) =>
+      (Number(isDecided(b.t)) - Number(isDecided(a.t))) || (a.i - b.i));
+    const kept = ordered.slice(0, keep).map(x => x.t);
+    ordered.slice(keep).forEach(({ t }) => { dupOf[t.id] = kept[0].id; });
+  });
+  return dupOf;
+}
+
 // ===== 突合エンジン（V8-04 / V8-05） =====
 
 /**
@@ -458,9 +491,16 @@ function runMatchingEngine(input) {
     .map(m => m.receipt_id + "|" + m.statement_id));
   const isRejected = (r, s) => rejected.has(r.id + "|" + s.id);
 
+  const dupOf = findDuplicateStatementRows(active.filter(t => t.kind === KIND.CARD),
+    t => !!approvedBy[t.id] || !isBlank_(t.decision));
+
   const open = [];
   active.forEach(t => {
     if (t.kind !== KIND.RECEIPT && t.kind !== KIND.CARD) return;
+    if (dupOf[t.id]) {
+      return set(t, STATE.DUP_ROW, "別の明細ファイルで取込済みの行と同一（利用日・金額・店名が一致）: " + dupOf[t.id] +
+        "（期間が重なるファイルの重複。突合の対象外）");
+    }
     if (approvedBy[t.id]) return set(t, STATE.APPROVED, "突合承認済み（" + approvedBy[t.id] + "）");
     if (t.decision === DECISION.APPROVE) return set(t, STATE.APPROVED, "個別承認: " + (t.review_memo || ""));
     if (t.decision === DECISION.REJECT) return set(t, STATE.REJECTED, "個別却下: " + (t.review_memo || ""));

@@ -66,7 +66,8 @@ function rematchAndRefresh_() {
 
 function summaryText_(r) {
   const order = [STATE.CANDIDATE, STATE.DUPLICATE, STATE.AMOUNT_DIFF, STATE.DATE_CHECK, STATE.FX_CHECK,
-    STATE.NEXT_MONTH, STATE.EXPIRED, STATE.UNMATCHED, STATE.OCR_CHECK, STATE.CLASSIFY, STATE.APPROVED, STATE.REJECTED];
+    STATE.NEXT_MONTH, STATE.EXPIRED, STATE.UNMATCHED, STATE.OCR_CHECK, STATE.CLASSIFY, STATE.DUP_ROW,
+    STATE.APPROVED, STATE.REJECTED];
   return order.filter(s => r.summary[s]).map(s => "  " + s + ": " + r.summary[s] + "件").join("\n") +
     "\n（状態変更 " + r.changed + "件・新規候補 " + r.added + "件）";
 }
@@ -210,7 +211,7 @@ function menuInit() {
       "1. フォルダマスタ: V7のフォルダIDを登録済み。各フォルダ直下に「2026-09」形式の月フォルダを作って原本を入れる\n" +
       "2. セゾン・DC などが同居する明細フォルダは、ファイル名にカード名を入れる（例: 2026-09_セゾン.csv）\n" +
       "3. カード明細列マスタ: 実ファイルの列名に合わせてカード別の行を追加\n" +
-      "4. 先生＋カード別に「_レシート」「_明細」「_突合結果」タブと「_カード不明」タブを作成済み\n" +
+      "4. 先生＋カード別の「_突合結果」タブ（レシート｜明細｜結果の横並び）と「_カード不明」タブを作成済み\n" +
       "5. ダウンロードした領収書・請求書はファイル名に「領収書」「請求書」等を入れる（原本区分の判定）\n\n" +
       "【月次の手順】\n① レシート読込 → ② カード明細読込 → 要確認一覧・突合結果で原本確認 → 判断を反映");
   });

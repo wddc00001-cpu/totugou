@@ -67,6 +67,7 @@ const STATE = {
   NEXT_MONTH:   "翌月確認",
   EXPIRED:      "期限超過",
   FX_CHECK:     "外貨要確認",
+  DUP_ROW:      "重複行",       // 期間が重なる明細ファイルで同じ行が2回取り込まれたもの（突合対象外）
   APPROVED:     "承認済み",
   REJECTED:     "却下",
 };
@@ -103,7 +104,7 @@ const SOURCE_TYPE = {
   STATEMENT: "カード明細",
 };
 
-// 先生＋カード別タブ: 「院長_M-AMEX_レシート」「院長_M-AMEX_明細」「院長_M-AMEX_突合結果」、支払手段不明は「院長_カード不明」
+// 先生＋カード別タブ: 「院長_M-AMEX_突合結果」（レシート｜明細｜結果を横並び）、支払手段不明は「院長_カード不明」。RECEIPT/STATEMENT は旧版タブの片付け用
 const CARD_TAB = { RECEIPT: "レシート", STATEMENT: "明細", RESULT: "突合結果", UNKNOWN: "カード不明" };
 
 // 設定シートの初期値
@@ -593,6 +594,39 @@ function correctionSignature(tx) {
   }));
 }
 
+// ===== 明細の重複行（期間が重なるファイルを両方取り込んだ場合） =====
+
+/**
+ * 別ファイルに同じ行（先生・カード・利用日・金額・店名・外貨額が一致）があるものを重複とみなす。
+ * - 日付や金額が1つでも違えば別の取引（同じ店・同じ月の複数回購入は重複にしない）
+ * - 同じ日・同じ店・同じ金額が本当に複数回ある場合は「1ファイル内の最大件数」までを残す
+ * - 残す行は、承認・個別判断済みの行 → 先に取り込んだ行の順
+ * @return { 重複行の取引ID: 残した行の取引ID }
+ */
+function findDuplicateStatementRows(stmts, isDecided) {
+  const groups = {};
+  stmts.forEach((t, i) => {
+    const e = effective(t);
+    if (!e.date || !isFinite(e.amount)) return;
+    const key = [t.person, t.method, e.date, e.amount, normalizeMerchant(e.merchant),
+      isBlank_(t.foreign_amount) ? "" : Number(t.foreign_amount)].join("|");
+    (groups[key] = groups[key] || []).push({ t, i });
+  });
+  const dupOf = {};
+  Object.values(groups).forEach(rows => {
+    const perFile = {};
+    rows.forEach(({ t }) => { perFile[t.file_id] = (perFile[t.file_id] || 0) + 1; });
+    const files = Object.keys(perFile);
+    if (files.length < 2) return;
+    const keep = Math.max(...files.map(f => perFile[f]));
+    const ordered = rows.slice().sort((a, b) =>
+      (Number(isDecided(b.t)) - Number(isDecided(a.t))) || (a.i - b.i));
+    const kept = ordered.slice(0, keep).map(x => x.t);
+    ordered.slice(keep).forEach(({ t }) => { dupOf[t.id] = kept[0].id; });
+  });
+  return dupOf;
+}
+
 // ===== 突合エンジン（V8-04 / V8-05） =====
 
 /**
@@ -625,9 +659,16 @@ function runMatchingEngine(input) {
     .map(m => m.receipt_id + "|" + m.statement_id));
   const isRejected = (r, s) => rejected.has(r.id + "|" + s.id);
 
+  const dupOf = findDuplicateStatementRows(active.filter(t => t.kind === KIND.CARD),
+    t => !!approvedBy[t.id] || !isBlank_(t.decision));
+
   const open = [];
   active.forEach(t => {
     if (t.kind !== KIND.RECEIPT && t.kind !== KIND.CARD) return;
+    if (dupOf[t.id]) {
+      return set(t, STATE.DUP_ROW, "別の明細ファイルで取込済みの行と同一（利用日・金額・店名が一致）: " + dupOf[t.id] +
+        "（期間が重なるファイルの重複。突合の対象外）");
+    }
     if (approvedBy[t.id]) return set(t, STATE.APPROVED, "突合承認済み（" + approvedBy[t.id] + "）");
     if (t.decision === DECISION.APPROVE) return set(t, STATE.APPROVED, "個別承認: " + (t.review_memo || ""));
     if (t.decision === DECISION.REJECT) return set(t, STATE.REJECTED, "個別却下: " + (t.review_memo || ""));
@@ -1683,7 +1724,7 @@ function rematch_() {
 /**
  * V8 画面（台帳から毎回生成する表示用シート）
  *   - 突合結果・要確認一覧: 全カード横断
- *   - 先生＋カード別: 「院長_M-AMEX_レシート」「院長_M-AMEX_明細」「院長_M-AMEX_突合結果」（日付順）
+ *   - 先生＋カード別: 「院長_M-AMEX_突合結果」1タブ。1行に レシート｜明細｜結果 を横並び・日付順
  *   - 支払手段不明のレシート: 「院長_カード不明」
  * 判断（承認/却下）とメモは「判断を反映」で台帳へ保存してから再生成するため、手入力は失われない。
  * 未反映の判断がある状態で再生成しようとした場合は処理を止める。
@@ -1701,13 +1742,11 @@ const REVIEW_HEADERS = [
   "原本種別", "原本区分", "日付", "金額", "通貨", "店舗名", "原本", "ページ/行",
 ];
 
-const CARD_RECEIPT_HEADERS = [
-  "取引ID", "状態", "日付", "店舗名", "金額", "通貨", "原本区分", "原本", "ページ", "読取メモ", "修正", "状態理由",
-];
-
-const CARD_STATEMENT_HEADERS = [
-  "取引ID", "状態", "利用日", "利用店名", "金額", "外貨額", "外貨通貨", "特殊区分", "原本", "明細行", "状態理由",
-];
+// 旧版（V8.0）で作っていたタブの見出し。これと完全に一致する表示用タブだけを片付ける
+const LEGACY_CARD_TAB_HEADERS = {
+  "レシート": ["取引ID", "状態", "日付", "店舗名", "金額", "通貨", "原本区分", "原本", "ページ", "読取メモ", "修正", "状態理由"],
+  "明細": ["取引ID", "状態", "利用日", "利用店名", "金額", "外貨額", "外貨通貨", "特殊区分", "原本", "明細行", "状態理由"],
+};
 
 const CARD_RESULT_HEADERS = [
   "判断", "判断メモ", "突合ID", "取引ID", "結果", "理由", "日付",
@@ -1865,28 +1904,15 @@ function cardCombos_(tx) {
 
 function refreshCardTabs_(tx, byId, matches) {
   const { list, unknownPersons } = cardCombos_(tx);
+  removeLegacyCardTabs_();
   const byDate = (a, b) => String(a.date).localeCompare(String(b.date));
 
   list.forEach(c => {
     const mine = t => t.person === c.person && t.method === c.method;
     const receipts = tx.filter(t => t.kind === KIND.RECEIPT && mine(t))
       .map(t => ({ t, e: effective(t) })).map(x => Object.assign(x, { date: x.e.date })).sort(byDate);
-    const stmts = tx.filter(t => t.kind === KIND.CARD && mine(t))
+    const stmts = tx.filter(t => t.kind === KIND.CARD && mine(t) && t.state !== STATE.DUP_ROW)
       .map(t => ({ t, e: effective(t) })).map(x => Object.assign(x, { date: x.e.date })).sort(byDate);
-
-    if (c.receipt) {
-      writeView_(cardTabName_(c.person, c.method, CARD_TAB.RECEIPT), CARD_RECEIPT_HEADERS,
-        receipts.map(({ t, e }) => [t.id, t.state, fmtYmdJa(e.date), e.merchant, amt_(e), e.currency, t.source_type,
-          sourceLink_(t), t.page, t.ocr_note, t.corr_sig ? "修正済み" : "", t.state_reason]),
-        receipts.map(({ t }) => STATE_COLORS[t.state] || "#ffffff"), "#1a73e8", { decision: false, frozenCols: 1 });
-    }
-    if (c.statement) {
-      writeView_(cardTabName_(c.person, c.method, CARD_TAB.STATEMENT), CARD_STATEMENT_HEADERS,
-        stmts.map(({ t, e }) => [t.id, t.state, fmtYmdJa(e.date), e.merchant, amt_(e), t.foreign_amount,
-          t.foreign_currency, t.special, sourceLink_(t), t.row_no, t.state_reason]),
-        stmts.map(({ t }) => STATE_COLORS[t.state] || "#ffffff"), "#0f9d58", { decision: false, frozenCols: 1 });
-    }
-    if (c.method === "現金") return;   // 現金はカード明細がないため突合結果タブを作らない
 
     // 突合結果: 候補・承認済みの組は1行に横並び。相手のない取引も1行ずつ出す
     const rows = [];
@@ -1930,6 +1956,20 @@ function refreshCardTabs_(tx, byId, matches) {
       list.map(({ t, e }) => ["", "", t.id, t.state, t.state_reason, fmtYmdJa(e.date), e.merchant, amt_(e), e.currency,
         t.source_type, sourceLink_(t), t.next_check_month]),
       list.map(({ t }) => STATE_COLORS[t.state] || "#ffffff"), "#8e24aa");
+  });
+}
+
+// 旧版の「_レシート」「_明細」タブ（表示専用・入力欄なし）を削除する。見出しが一致しないシートには触れない
+function removeLegacyCardTabs_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.getSheets().forEach(sh => {
+    const m = sh.getName().match(/_(レシート|明細)$/);
+    if (!m || ss.getSheets().length < 2) return;
+    const want = LEGACY_CARD_TAB_HEADERS[m[1]];
+    const width = sh.getLastColumn();
+    if (width !== want.length) return;
+    const head = sh.getRange(1, 1, 1, width).getValues()[0].map(String);
+    if (head.every((h, i) => h === want[i])) ss.deleteSheet(sh);
   });
 }
 
@@ -2187,7 +2227,8 @@ function rematchAndRefresh_() {
 
 function summaryText_(r) {
   const order = [STATE.CANDIDATE, STATE.DUPLICATE, STATE.AMOUNT_DIFF, STATE.DATE_CHECK, STATE.FX_CHECK,
-    STATE.NEXT_MONTH, STATE.EXPIRED, STATE.UNMATCHED, STATE.OCR_CHECK, STATE.CLASSIFY, STATE.APPROVED, STATE.REJECTED];
+    STATE.NEXT_MONTH, STATE.EXPIRED, STATE.UNMATCHED, STATE.OCR_CHECK, STATE.CLASSIFY, STATE.DUP_ROW,
+    STATE.APPROVED, STATE.REJECTED];
   return order.filter(s => r.summary[s]).map(s => "  " + s + ": " + r.summary[s] + "件").join("\n") +
     "\n（状態変更 " + r.changed + "件・新規候補 " + r.added + "件）";
 }
@@ -2331,7 +2372,7 @@ function menuInit() {
       "1. フォルダマスタ: V7のフォルダIDを登録済み。各フォルダ直下に「2026-09」形式の月フォルダを作って原本を入れる\n" +
       "2. セゾン・DC などが同居する明細フォルダは、ファイル名にカード名を入れる（例: 2026-09_セゾン.csv）\n" +
       "3. カード明細列マスタ: 実ファイルの列名に合わせてカード別の行を追加\n" +
-      "4. 先生＋カード別に「_レシート」「_明細」「_突合結果」タブと「_カード不明」タブを作成済み\n" +
+      "4. 先生＋カード別の「_突合結果」タブ（レシート｜明細｜結果の横並び）と「_カード不明」タブを作成済み\n" +
       "5. ダウンロードした領収書・請求書はファイル名に「領収書」「請求書」等を入れる（原本区分の判定）\n\n" +
       "【月次の手順】\n① レシート読込 → ② カード明細読込 → 要確認一覧・突合結果で原本確認 → 判断を反映");
   });

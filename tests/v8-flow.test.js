@@ -193,18 +193,19 @@ test("V8 受入フロー", async () => {
   await t.gs.menuImportStatements();
   assert.equal(byPage(t, 5)["状態"], "一致候補");
 
-  // 先生＋カード別タブ（レシート・明細・突合結果）とカード不明タブ
+  // 先生＋カード別は「_突合結果」1タブ（レシート｜明細｜結果を横並び・日付順）とカード不明タブ
   const names = t.env.ss.getSheets().map(sh => sh.getName());
-  for (const n of ["院長_M-AMEX_レシート", "院長_M-AMEX_明細", "院長_M-AMEX_突合結果",
-    "麻記子先生_楽天_明細", "麻記子先生_楽天_突合結果", "院長_カード不明", "麻記子先生_カード不明"]) {
+  for (const n of ["院長_M-AMEX_突合結果", "麻記子先生_楽天_突合結果", "院長_カード不明", "麻記子先生_カード不明"]) {
     assert.ok(names.includes(n), n + " タブがない");
   }
-  const recTab = t.env.ss.getSheetByName("院長_M-AMEX_レシート").records();
-  assert.equal(recTab.length, 11, "10ページ＋分割した1行");
-  assert.equal(recTab[0]["原本区分"], "紙レシート（スキャン）");
-  const dates = recTab.map(r => r["日付"]).filter(Boolean);
+  assert.ok(!names.some(n => /_(レシート|明細)$/.test(n)), "レシート・明細の個別タブは作らない");
+  const cardRows = t.env.ss.getSheetByName("院長_M-AMEX_突合結果").records();
+  const dates = cardRows.map(r => r["日付"]).filter(Boolean);
   assert.deepEqual(dates, [...dates].sort(), "日付順");
-  assert.equal(t.env.ss.getSheetByName("院長_M-AMEX_明細").records().filter(r => r["状態"] !== "").length, 9);
+  assert.equal(cardRows.filter(r => r["レシート取引ID"]).length >= 11, true, "10ページ＋分割1行のレシートがすべて出る");
+  assert.ok(cardRows.some(r => r["明細店舗名"] === "年会費" && !r["レシート取引ID"]), "明細だけの行も出る");
+  assert.ok(cardRows.some(r => r["レシート金額"] === 300 && !r["明細取引ID"]), "レシートだけの行も出る");
+  assert.equal(cardRows.find(r => r["レシート金額"] === 1200)["原本区分"], "紙レシート（スキャン）");
 
   // カード別の突合結果タブから承認（突合単位）と、明細のみ行の個別承認（取引単位）
   const cardRes = t.env.ss.getSheetByName("院長_M-AMEX_突合結果");
@@ -250,4 +251,45 @@ test("初期化を再実行してもデータは消えない", async () => {
   await t.gs.menuInit();
   assert.equal(txs(t).length, n);
   assert.equal(t.env.ss.getSheetByName("フォルダマスタ").records().length, 3, "マスタを上書きしない");
+});
+
+test("期間が重なる明細ファイルの重複行は突合対象外。同じ店・同じ月でも日付や金額が違えば残す", async () => {
+  const t = setup();
+  await init(t);
+  const head = "ご利用日,ご利用店名,ご利用金額\n";
+  // 9/1〜9/30 と 9/15〜10/15 のダウンロード（9/15〜9/30 が重なる）
+  t.drive.file(t.csvMonth, "2026-09_M-AMEX.csv", CSV, head +
+    "2026/09/05,スターバックス,650\n" +
+    "2026/09/18,スターバックス,650\n2026/09/18,スターバックス,650\n" +   // 同日・同店・同額が本当に2回
+    "2026/09/20,スターバックス,700\n" +
+    "2026/09/25,ENEOS,5000\n");
+  const oct = t.drive.subfolder(t.csvRoot, "2026-10");
+  t.drive.file(oct, "2026-10_M-AMEX.csv", CSV, head +
+    "2026/09/18,スターバックス,650\n2026/09/18,スターバックス,650\n" +
+    "2026/09/20,スターバックス,700\n" +
+    "2026/09/25,ENEOS,5000\n" +
+    "2026/09/25,ENEOS,5200\n" +                                           // 同日・同店でも金額が違う
+    "2026/10/05,スターバックス,650\n");                                   // 同店・同額でも日付が違う
+  await t.gs.menuImportStatements();
+  const all = txs(t).filter(x => x["原本種別"] === "カード明細");
+  assert.equal(all.length, 11, "取込自体は全行（削除しない）");
+  const dup = all.filter(x => x["状態"] === "重複行");
+  assert.equal(dup.length, 4, "重なった4行だけが重複行");
+  assert.ok(dup.every(x => /取込済みの行と同一/.test(x["状態理由"])));
+  const live = all.filter(x => x["状態"] !== "重複行");
+  const count = (d, a) => live.filter(x => x["原本_日付"] === d && x["原本_金額"] === a).length;
+  assert.equal(count("2026-09-18", 650), 2, "同日・同店・同額2回は2件とも残す");
+  assert.equal(count("2026-09-25", 5200), 1);
+  assert.equal(count("2026-10-05", 650), 1);
+  assert.match(lastAlert(t), /重複行: 4件/);
+
+  // レシートは重複行に引っ張られず、候補重複にならない
+  t.drive.file(t.recMonth, "p.pdf", "application/pdf", "%PDF");
+  t.ctx.openPdfPages_ = async () => ({ count: 1, page: async () => ({ page: "x" }) });
+  t.ctx.driveOcr_ = () => "ENEOS\n2026/09/25\n合計 ¥5,000";
+  await t.gs.menuImportReceipts();
+  const r = txs(t).find(x => x["原本種別"] === "レシート/領収書/請求書");
+  assert.equal(r["状態"], "一致候補");
+  const tab = t.env.ss.getSheetByName("院長_M-AMEX_突合結果").records();
+  assert.ok(!tab.some(x => x["結果"] === "重複行"), "突合結果タブに重複行は出さない");
 });

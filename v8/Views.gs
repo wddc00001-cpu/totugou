@@ -1,7 +1,7 @@
 /**
  * V8 画面（台帳から毎回生成する表示用シート）
  *   - 突合結果・要確認一覧: 全カード横断
- *   - 先生＋カード別: 「院長_M-AMEX_レシート」「院長_M-AMEX_明細」「院長_M-AMEX_突合結果」（日付順）
+ *   - 先生＋カード別: 「院長_M-AMEX_突合結果」1タブ。1行に レシート｜明細｜結果 を横並び・日付順
  *   - 支払手段不明のレシート: 「院長_カード不明」
  * 判断（承認/却下）とメモは「判断を反映」で台帳へ保存してから再生成するため、手入力は失われない。
  * 未反映の判断がある状態で再生成しようとした場合は処理を止める。
@@ -19,13 +19,11 @@ const REVIEW_HEADERS = [
   "原本種別", "原本区分", "日付", "金額", "通貨", "店舗名", "原本", "ページ/行",
 ];
 
-const CARD_RECEIPT_HEADERS = [
-  "取引ID", "状態", "日付", "店舗名", "金額", "通貨", "原本区分", "原本", "ページ", "読取メモ", "修正", "状態理由",
-];
-
-const CARD_STATEMENT_HEADERS = [
-  "取引ID", "状態", "利用日", "利用店名", "金額", "外貨額", "外貨通貨", "特殊区分", "原本", "明細行", "状態理由",
-];
+// 旧版（V8.0）で作っていたタブの見出し。これと完全に一致する表示用タブだけを片付ける
+const LEGACY_CARD_TAB_HEADERS = {
+  "レシート": ["取引ID", "状態", "日付", "店舗名", "金額", "通貨", "原本区分", "原本", "ページ", "読取メモ", "修正", "状態理由"],
+  "明細": ["取引ID", "状態", "利用日", "利用店名", "金額", "外貨額", "外貨通貨", "特殊区分", "原本", "明細行", "状態理由"],
+};
 
 const CARD_RESULT_HEADERS = [
   "判断", "判断メモ", "突合ID", "取引ID", "結果", "理由", "日付",
@@ -183,28 +181,15 @@ function cardCombos_(tx) {
 
 function refreshCardTabs_(tx, byId, matches) {
   const { list, unknownPersons } = cardCombos_(tx);
+  removeLegacyCardTabs_();
   const byDate = (a, b) => String(a.date).localeCompare(String(b.date));
 
   list.forEach(c => {
     const mine = t => t.person === c.person && t.method === c.method;
     const receipts = tx.filter(t => t.kind === KIND.RECEIPT && mine(t))
       .map(t => ({ t, e: effective(t) })).map(x => Object.assign(x, { date: x.e.date })).sort(byDate);
-    const stmts = tx.filter(t => t.kind === KIND.CARD && mine(t))
+    const stmts = tx.filter(t => t.kind === KIND.CARD && mine(t) && t.state !== STATE.DUP_ROW)
       .map(t => ({ t, e: effective(t) })).map(x => Object.assign(x, { date: x.e.date })).sort(byDate);
-
-    if (c.receipt) {
-      writeView_(cardTabName_(c.person, c.method, CARD_TAB.RECEIPT), CARD_RECEIPT_HEADERS,
-        receipts.map(({ t, e }) => [t.id, t.state, fmtYmdJa(e.date), e.merchant, amt_(e), e.currency, t.source_type,
-          sourceLink_(t), t.page, t.ocr_note, t.corr_sig ? "修正済み" : "", t.state_reason]),
-        receipts.map(({ t }) => STATE_COLORS[t.state] || "#ffffff"), "#1a73e8", { decision: false, frozenCols: 1 });
-    }
-    if (c.statement) {
-      writeView_(cardTabName_(c.person, c.method, CARD_TAB.STATEMENT), CARD_STATEMENT_HEADERS,
-        stmts.map(({ t, e }) => [t.id, t.state, fmtYmdJa(e.date), e.merchant, amt_(e), t.foreign_amount,
-          t.foreign_currency, t.special, sourceLink_(t), t.row_no, t.state_reason]),
-        stmts.map(({ t }) => STATE_COLORS[t.state] || "#ffffff"), "#0f9d58", { decision: false, frozenCols: 1 });
-    }
-    if (c.method === "現金") return;   // 現金はカード明細がないため突合結果タブを作らない
 
     // 突合結果: 候補・承認済みの組は1行に横並び。相手のない取引も1行ずつ出す
     const rows = [];
@@ -248,5 +233,19 @@ function refreshCardTabs_(tx, byId, matches) {
       list.map(({ t, e }) => ["", "", t.id, t.state, t.state_reason, fmtYmdJa(e.date), e.merchant, amt_(e), e.currency,
         t.source_type, sourceLink_(t), t.next_check_month]),
       list.map(({ t }) => STATE_COLORS[t.state] || "#ffffff"), "#8e24aa");
+  });
+}
+
+// 旧版の「_レシート」「_明細」タブ（表示専用・入力欄なし）を削除する。見出しが一致しないシートには触れない
+function removeLegacyCardTabs_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.getSheets().forEach(sh => {
+    const m = sh.getName().match(/_(レシート|明細)$/);
+    if (!m || ss.getSheets().length < 2) return;
+    const want = LEGACY_CARD_TAB_HEADERS[m[1]];
+    const width = sh.getLastColumn();
+    if (width !== want.length) return;
+    const head = sh.getRange(1, 1, 1, width).getValues()[0].map(String);
+    if (head.every((h, i) => h === want[i])) ss.deleteSheet(sh);
   });
 }
