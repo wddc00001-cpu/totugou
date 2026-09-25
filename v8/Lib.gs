@@ -151,6 +151,16 @@ function detectMethodFromName(fileName, methods, aliases) {
   return { method: hits.length === 1 ? hits[0] : "", hits };
 }
 
+// 原本区分: ファイル名にダウンロード判定キーワードがあればダウンロード、なければ紙レシート（スキャン）
+function detectSourceType(fileName, pattern) {
+  if (pattern) {
+    let re;
+    try { re = new RegExp(pattern, "i"); } catch (_) { re = null; }
+    if (re && re.test(nfkc_(fileName))) return SOURCE_TYPE.DOWNLOAD;
+  }
+  return SOURCE_TYPE.PAPER;
+}
+
 // ===== CSV =====
 
 // RFC 4180 相当（引用符内のカンマ・改行・"" エスケープ）

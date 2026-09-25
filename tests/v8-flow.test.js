@@ -193,6 +193,37 @@ test("V8 受入フロー", async () => {
   await t.gs.menuImportStatements();
   assert.equal(byPage(t, 5)["状態"], "一致候補");
 
+  // 先生＋カード別タブ（レシート・明細・突合結果）とカード不明タブ
+  const names = t.env.ss.getSheets().map(sh => sh.getName());
+  for (const n of ["院長_M-AMEX_レシート", "院長_M-AMEX_明細", "院長_M-AMEX_突合結果",
+    "麻記子先生_楽天_明細", "麻記子先生_楽天_突合結果", "院長_カード不明", "麻記子先生_カード不明"]) {
+    assert.ok(names.includes(n), n + " タブがない");
+  }
+  const recTab = t.env.ss.getSheetByName("院長_M-AMEX_レシート").records();
+  assert.equal(recTab.length, 11, "10ページ＋分割した1行");
+  assert.equal(recTab[0]["原本区分"], "紙レシート（スキャン）");
+  const dates = recTab.map(r => r["日付"]).filter(Boolean);
+  assert.deepEqual(dates, [...dates].sort(), "日付順");
+  assert.equal(t.env.ss.getSheetByName("院長_M-AMEX_明細").records().filter(r => r["状態"] !== "").length, 9);
+
+  // カード別の突合結果タブから承認（突合単位）と、明細のみ行の個別承認（取引単位）
+  const cardRes = t.env.ss.getSheetByName("院長_M-AMEX_突合結果");
+  const p5id = byPage(t, 5)["取引ID"];
+  const p5row = cardRes.records().find(r => r["レシート取引ID"] === p5id);
+  assert.equal(p5row["結果"], "一致候補");
+  assert.equal(p5row["明細金額"], 5500, "レシートと明細が1行に横並び");
+  setCell(cardRes, r => r["レシート取引ID"] === p5id, "判断", "承認");
+  const feeRow = cardRes.records().find(r => r["明細店舗名"] === "年会費");
+  assert.equal(feeRow["結果"], "未突合");
+  setCell(cardRes, r => r["明細店舗名"] === "年会費", "判断", "承認");
+  setCell(cardRes, r => r["明細店舗名"] === "年会費", "判断メモ", "年会費は明細のみで計上");
+  await t.gs.menuApplyDecisions();
+  assert.match(lastAlert(t), /承認: 1件 \/ 却下: 0件 \/ 個別判断: 1件/);
+  assert.equal(byPage(t, 5)["状態"], "承認済み");
+  assert.equal(txs(t).find(x => x["原本_店舗名"] === "年会費" && x["旧版"] !== true)["状態"], "承認済み");
+  assert.equal(t.env.ss.getSheetByName("院長_M-AMEX_突合結果").records().find(r => r["レシート取引ID"] === p5id)["結果"],
+    "承認済み");
+
   // 原本の差替え（同じDriveファイルIDで内容変更）→ 処理版が増え、旧版は削除せず残る
   const stmtFile = t.csvMonth.files[0];
   stmtFile.setContent("ご利用日,ご利用店名,ご利用金額\n2026/09/03,ﾛｰｿﾝ 徳島店,1200\n");

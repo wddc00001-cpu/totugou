@@ -17,7 +17,7 @@ FIELDS[SHEET.FILES] = [
 
 FIELDS[SHEET.TX] = [
   ["id", "取引ID"], ["state", "状態"], ["state_reason", "状態理由"], ["next_check_month", "翌月確認月"],
-  ["kind", "原本種別"], ["person", "人物"], ["method", "支払手段"], ["target_month", "対象月"],
+  ["kind", "原本種別"], ["source_type", "原本区分"], ["person", "人物"], ["method", "支払手段"], ["target_month", "対象月"],
   ["orig_date", "原本_日付"], ["orig_amount", "原本_金額"], ["currency", "通貨"], ["orig_merchant", "原本_店舗名"],
   ["corr_date", "修正_日付"], ["corr_amount", "修正_金額"], ["corr_currency", "修正_通貨"], ["corr_merchant", "修正_店舗名"],
   ["corr_reason", "修正理由"], ["corr_by", "修正者"], ["corr_at", "修正日時"],
@@ -180,6 +180,8 @@ function loadSettings_() {
     dateWindow:    num("日付要確認の検出幅(日)", 45),
     graceMonths:   num("翌月確認の猶予(月)", 1),
     timeBudgetMs:  num("処理時間上限(秒)", 270) * 1000,
+    downloadPattern: String(isBlank_(map["ダウンロード判定キーワード"])
+      ? DEFAULT_SETTINGS.find(r => r[0] === "ダウンロード判定キーワード")[1] : map["ダウンロード判定キーワード"]),
     pdfLibUrl:     String(map["pdf-lib URL"] || DEFAULT_SETTINGS.find(r => r[0] === "pdf-lib URL")[1]),
   };
 }

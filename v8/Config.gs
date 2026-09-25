@@ -91,6 +91,16 @@ const IMPORT_STATUS = {
 
 const DECISION = { APPROVE: "承認", REJECT: "却下" };
 
+// 原本区分（紙のレシートか、ダウンロードした領収書・請求書か。同じ列で区別する）
+const SOURCE_TYPE = {
+  PAPER:     "紙レシート（スキャン）",
+  DOWNLOAD:  "ダウンロード（領収書・請求書）",
+  STATEMENT: "カード明細",
+};
+
+// 先生＋カード別タブ: 「院長_M-AMEX_レシート」「院長_M-AMEX_明細」「院長_M-AMEX_突合結果」、支払手段不明は「院長_カード不明」
+const CARD_TAB = { RECEIPT: "レシート", STATEMENT: "明細", RESULT: "突合結果", UNKNOWN: "カード不明" };
+
 // 設定シートの初期値
 const DEFAULT_SETTINGS = [
   ["日付許容日数",            3,   "カード別の値が「カード明細列マスタ」にあればそちらを優先"],
@@ -98,6 +108,8 @@ const DEFAULT_SETTINGS = [
   ["日付要確認の検出幅(日)",  45,  "同額でこの日数以内なら『日付要確認』として相手候補を示す"],
   ["翌月確認の猶予(月)",      1,   "翌月確認の対象月からこの月数を過ぎても相手が無ければ『期限超過』"],
   ["処理時間上限(秒)",        270, "Apps Script の6分制限に対する安全マージン。超えたら中断し、再実行で続きから再開"],
+  ["ダウンロード判定キーワード", "領収|請求|invoice|receipt|download|ダウンロード|DL_",
+   "ファイル名にこの語が入っていれば原本区分を『ダウンロード』、なければ『紙レシート』にする（取引台帳で手修正可）"],
   ["pdf-lib URL", "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js", "一括PDFのページ分割に使用"],
 ];
 

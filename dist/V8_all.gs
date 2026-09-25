@@ -96,6 +96,16 @@ const IMPORT_STATUS = {
 
 const DECISION = { APPROVE: "承認", REJECT: "却下" };
 
+// 原本区分（紙のレシートか、ダウンロードした領収書・請求書か。同じ列で区別する）
+const SOURCE_TYPE = {
+  PAPER:     "紙レシート（スキャン）",
+  DOWNLOAD:  "ダウンロード（領収書・請求書）",
+  STATEMENT: "カード明細",
+};
+
+// 先生＋カード別タブ: 「院長_M-AMEX_レシート」「院長_M-AMEX_明細」「院長_M-AMEX_突合結果」、支払手段不明は「院長_カード不明」
+const CARD_TAB = { RECEIPT: "レシート", STATEMENT: "明細", RESULT: "突合結果", UNKNOWN: "カード不明" };
+
 // 設定シートの初期値
 const DEFAULT_SETTINGS = [
   ["日付許容日数",            3,   "カード別の値が「カード明細列マスタ」にあればそちらを優先"],
@@ -103,6 +113,8 @@ const DEFAULT_SETTINGS = [
   ["日付要確認の検出幅(日)",  45,  "同額でこの日数以内なら『日付要確認』として相手候補を示す"],
   ["翌月確認の猶予(月)",      1,   "翌月確認の対象月からこの月数を過ぎても相手が無ければ『期限超過』"],
   ["処理時間上限(秒)",        270, "Apps Script の6分制限に対する安全マージン。超えたら中断し、再実行で続きから再開"],
+  ["ダウンロード判定キーワード", "領収|請求|invoice|receipt|download|ダウンロード|DL_",
+   "ファイル名にこの語が入っていれば原本区分を『ダウンロード』、なければ『紙レシート』にする（取引台帳で手修正可）"],
   ["pdf-lib URL", "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js", "一括PDFのページ分割に使用"],
 ];
 
@@ -304,6 +316,16 @@ function detectMethodFromName(fileName, methods, aliases) {
     return keys.concat([mt]).some(k => name.includes(nfkc_(k).toLowerCase()));
   });
   return { method: hits.length === 1 ? hits[0] : "", hits };
+}
+
+// 原本区分: ファイル名にダウンロード判定キーワードがあればダウンロード、なければ紙レシート（スキャン）
+function detectSourceType(fileName, pattern) {
+  if (pattern) {
+    let re;
+    try { re = new RegExp(pattern, "i"); } catch (_) { re = null; }
+    if (re && re.test(nfkc_(fileName))) return SOURCE_TYPE.DOWNLOAD;
+  }
+  return SOURCE_TYPE.PAPER;
 }
 
 // ===== CSV =====
@@ -794,7 +816,7 @@ FIELDS[SHEET.FILES] = [
 
 FIELDS[SHEET.TX] = [
   ["id", "取引ID"], ["state", "状態"], ["state_reason", "状態理由"], ["next_check_month", "翌月確認月"],
-  ["kind", "原本種別"], ["person", "人物"], ["method", "支払手段"], ["target_month", "対象月"],
+  ["kind", "原本種別"], ["source_type", "原本区分"], ["person", "人物"], ["method", "支払手段"], ["target_month", "対象月"],
   ["orig_date", "原本_日付"], ["orig_amount", "原本_金額"], ["currency", "通貨"], ["orig_merchant", "原本_店舗名"],
   ["corr_date", "修正_日付"], ["corr_amount", "修正_金額"], ["corr_currency", "修正_通貨"], ["corr_merchant", "修正_店舗名"],
   ["corr_reason", "修正理由"], ["corr_by", "修正者"], ["corr_at", "修正日時"],
@@ -957,6 +979,8 @@ function loadSettings_() {
     dateWindow:    num("日付要確認の検出幅(日)", 45),
     graceMonths:   num("翌月確認の猶予(月)", 1),
     timeBudgetMs:  num("処理時間上限(秒)", 270) * 1000,
+    downloadPattern: String(isBlank_(map["ダウンロード判定キーワード"])
+      ? DEFAULT_SETTINGS.find(r => r[0] === "ダウンロード判定キーワード")[1] : map["ダウンロード判定キーワード"]),
     pdfLibUrl:     String(map["pdf-lib URL"] || DEFAULT_SETTINGS.find(r => r[0] === "pdf-lib URL")[1]),
   };
 }
@@ -1354,7 +1378,7 @@ async function processReceiptFile_(ctx, file, entry, report) {
       ctx.files.touch(entry);
       return false;
     }
-    const tx = newReceiptTx_(entry, p);
+    const tx = newReceiptTx_(entry, p, ctx.settings);
     try {
       const text = driveOcr_(await pages.page(p));
       applyOcrResult_(tx, text);
@@ -1380,10 +1404,10 @@ async function processReceiptFile_(ctx, file, entry, report) {
   return true;
 }
 
-function newReceiptTx_(entry, page) {
+function newReceiptTx_(entry, page, settings) {
   return {
     id: newId_("R"), state: STATE.PENDING, state_reason: "", next_check_month: "",
-    kind: KIND.RECEIPT, person: entry.person, method: entry.method, target_month: entry.target_month,
+    kind: KIND.RECEIPT, source_type: detectSourceType(entry.file_name, settings.downloadPattern), person: entry.person, method: entry.method, target_month: entry.target_month,
     orig_date: "", orig_amount: "", currency: "JPY", orig_merchant: "",
     link: entry.link, page, row_no: "",
     foreign_amount: "", foreign_currency: "", jpy_amount: "", fx_basis: "",
@@ -1479,7 +1503,7 @@ function processStatementFile_(ctx, file, entry, master, report) {
     const bad = !!r.note;
     ctx.tx.insert({
       id: newId_("S"), state: bad ? STATE.OCR_CHECK : STATE.PENDING, state_reason: r.note, next_check_month: "",
-      kind: KIND.CARD, person: entry.person, method: entry.method, target_month: entry.target_month,
+      kind: KIND.CARD, source_type: SOURCE_TYPE.STATEMENT, person: entry.person, method: entry.method, target_month: entry.target_month,
       orig_date: r.date, orig_amount: r.amount, currency: "JPY", orig_merchant: r.merchant,
       link: entry.link, page: "", row_no: r.row_no,
       foreign_amount: r.foreign_amount, foreign_currency: r.foreign_currency, jpy_amount: r.amount,
@@ -1657,7 +1681,10 @@ function rematch_() {
 // ===== v8/Views.gs
 // ======================================================================
 /**
- * V8 画面: 突合結果・要確認一覧（台帳から毎回生成する表示用シート）
+ * V8 画面（台帳から毎回生成する表示用シート）
+ *   - 突合結果・要確認一覧: 全カード横断
+ *   - 先生＋カード別: 「院長_M-AMEX_レシート」「院長_M-AMEX_明細」「院長_M-AMEX_突合結果」（日付順）
+ *   - 支払手段不明のレシート: 「院長_カード不明」
  * 判断（承認/却下）とメモは「判断を反映」で台帳へ保存してから再生成するため、手入力は失われない。
  * 未反映の判断がある状態で再生成しようとした場合は処理を止める。
  */
@@ -1665,13 +1692,33 @@ function rematch_() {
 const RESULT_HEADERS = [
   "判断", "判断メモ", "突合ID", "候補区分", "突合状態", "人物", "支払手段", "対象月",
   "レシート日付", "レシート金額", "明細日付", "明細金額", "金額差", "日付差", "店舗名評価",
-  "レシート店舗名", "明細店舗名", "レシート原本", "明細原本", "レシート取引ID", "明細取引ID",
+  "レシート店舗名", "明細店舗名", "原本区分", "レシート原本", "明細原本", "レシート取引ID", "明細取引ID",
   "判断者", "判断日時", "記録済みメモ",
 ];
 
 const REVIEW_HEADERS = [
   "判断", "判断メモ", "取引ID", "状態", "状態理由", "翌月確認月", "人物", "支払手段", "対象月",
-  "原本種別", "日付", "金額", "通貨", "店舗名", "原本", "ページ/行",
+  "原本種別", "原本区分", "日付", "金額", "通貨", "店舗名", "原本", "ページ/行",
+];
+
+const CARD_RECEIPT_HEADERS = [
+  "取引ID", "状態", "日付", "店舗名", "金額", "通貨", "原本区分", "原本", "ページ", "読取メモ", "修正", "状態理由",
+];
+
+const CARD_STATEMENT_HEADERS = [
+  "取引ID", "状態", "利用日", "利用店名", "金額", "外貨額", "外貨通貨", "特殊区分", "原本", "明細行", "状態理由",
+];
+
+const CARD_RESULT_HEADERS = [
+  "判断", "判断メモ", "突合ID", "取引ID", "結果", "理由", "日付",
+  "レシート店舗名", "レシート金額", "原本区分", "レシート原本",
+  "明細日付", "明細店舗名", "明細金額", "明細原本",
+  "金額差", "日付差", "店舗名評価", "翌月確認月", "レシート取引ID", "明細取引ID",
+];
+
+const CARD_UNKNOWN_HEADERS = [
+  "判断", "判断メモ", "取引ID", "状態", "状態理由（候補カード・翌月確認）", "日付", "店舗名", "金額", "通貨",
+  "原本区分", "原本", "翌月確認月",
 ];
 
 const STATE_COLORS = {
@@ -1686,18 +1733,31 @@ function sourceLink_(t) {
   return '=HYPERLINK("' + String(t.link).replace(/"/g, '""') + '","' + label + '")';
 }
 
+function cardTabName_(person, method, kind) {
+  return method ? person + "_" + method + "_" + kind : person + "_" + kind;
+}
+
+// 判断（承認/却下）を入力できるシート: 突合結果・要確認一覧・先生＋カード別の突合結果・カード不明
+function isDecisionSheetName_(name) {
+  return name === SHEET.RESULT || name === SHEET.REVIEW ||
+    name.endsWith("_" + CARD_TAB.RESULT) || name.endsWith("_" + CARD_TAB.UNKNOWN);
+}
+
+function decisionSheets_() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheets().filter(sh => isDecisionSheetName_(sh.getName()));
+}
+
 function pendingDecisionCount_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
   let n = 0;
-  [SHEET.RESULT, SHEET.REVIEW].forEach(name => {
-    const sh = ss.getSheetByName(name);
-    if (!sh || sh.getLastRow() < 2) return;
+  decisionSheets_().forEach(sh => {
+    if (sh.getLastRow() < 2) return;
     n += sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().filter(r => !isBlank_(r[0])).length;
   });
   return n;
 }
 
-function writeView_(name, headers, rows, colors, color) {
+function writeView_(name, headers, rows, colors, color, opts) {
+  const o = Object.assign({ decision: true, frozenCols: 3 }, opts || {});
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName(name) || ss.insertSheet(name);
   if (sh.getFilter()) sh.getFilter().remove();
@@ -1705,19 +1765,23 @@ function writeView_(name, headers, rows, colors, color) {
   sh.getRange(1, 1, 1, headers.length).setValues([headers])
     .setBackground(color).setFontColor("#ffffff").setFontWeight("bold");
   sh.setFrozenRows(1);
-  sh.setFrozenColumns(3);
+  sh.setFrozenColumns(o.frozenCols);
   if (rows.length) {
     const range = sh.getRange(2, 1, rows.length, headers.length);
     range.setValues(rows.map(r => r.map((v, j) => (/原本$/.test(headers[j]) ? v : plainCell_(v)))));
     range.setBackgrounds(colors.map(c => headers.map(() => c)));
-    const rule = SpreadsheetApp.newDataValidation()
-      .requireValueInList([DECISION.APPROVE, DECISION.REJECT], true).setAllowInvalid(false).build();
-    sh.getRange(2, 1, rows.length, 1).setDataValidation(rule).setBackground("#fff8e1");
-    sh.getRange(2, 2, rows.length, 1).setBackground("#fff8e1");
+    if (o.decision) {
+      const rule = SpreadsheetApp.newDataValidation()
+        .requireValueInList([DECISION.APPROVE, DECISION.REJECT], true).setAllowInvalid(false).build();
+      sh.getRange(2, 1, rows.length, 1).setDataValidation(rule).setBackground("#fff8e1");
+      sh.getRange(2, 2, rows.length, 1).setBackground("#fff8e1");
+    }
   }
   sh.getRange(1, 1, Math.max(rows.length, 1) + 1, headers.length).createFilter();
   return sh;
 }
+
+const amt_ = e => (isFinite(e.amount) ? e.amount : "");
 
 function refreshViews_() {
   const tx = Table.open(SHEET.TX).all().filter(t => !isTrue_(t.superseded));
@@ -1742,8 +1806,8 @@ function refreshViews_() {
       const er = effective(r), es = effective(s);
       resRows.push([
         "", "", m.match_id, m.kind, m.status, r.person, r.method, r.target_month,
-        fmtYmdJa(er.date), isFinite(er.amount) ? er.amount : "", fmtYmdJa(es.date), isFinite(es.amount) ? es.amount : "",
-        m.amount_diff, m.date_diff, m.merchant_eval, er.merchant, es.merchant,
+        fmtYmdJa(er.date), amt_(er), fmtYmdJa(es.date), amt_(es),
+        m.amount_diff, m.date_diff, m.merchant_eval, er.merchant, es.merchant, r.source_type,
         sourceLink_(r), sourceLink_(s), r.id, s.id, m.decided_by, m.decided_at, m.decision_memo,
       ]);
       resColors.push(m.status === MATCH_STATUS.CANDIDATE ? (STATE_COLORS[m.kind] || "#ffffff") : "#eeeeee");
@@ -1755,7 +1819,7 @@ function refreshViews_() {
   files.filter(f => [IMPORT_STATUS.CLASSIFY, IMPORT_STATUS.ERROR, IMPORT_STATUS.UNSUPPORTED, IMPORT_STATUS.PROCESSING]
     .includes(f.status))
     .forEach(f => {
-      revRows.push(["", "", "", f.status, f.message, "", f.person, f.method, f.target_month, f.kind,
+      revRows.push(["", "", "", f.status, f.message, "", f.person, f.method, f.target_month, f.kind, "",
         "", "", "", f.file_name, '=HYPERLINK("' + f.link + '","原本")', ""]);
       revColors.push("#f1f3f4");
     });
@@ -1767,12 +1831,106 @@ function refreshViews_() {
     .forEach(({ t, e }) => {
       revRows.push([
         "", "", t.id, t.state, t.state_reason, t.next_check_month, t.person, t.method, t.target_month,
-        t.kind, fmtYmdJa(e.date), isFinite(e.amount) ? e.amount : "", e.currency, e.merchant,
+        t.kind, t.source_type, fmtYmdJa(e.date), amt_(e), e.currency, e.merchant,
         sourceLink_(t), t.page || t.row_no || "",
       ]);
       revColors.push(STATE_COLORS[t.state] || "#ffffff");
     });
   writeView_(SHEET.REVIEW, REVIEW_HEADERS, revRows, revColors, "#b3261e");
+
+  refreshCardTabs_(tx, byId, matches);
+}
+
+// ===== 先生＋カード別タブ =====
+
+// フォルダマスタと取引から「先生＋支払手段」の組と、作るタブの種類を決める
+function cardCombos_(tx) {
+  const combos = {};
+  const add = (person, method, kind) => {
+    if (!person || !method) return;
+    const k = person + "|" + method;
+    const c = combos[k] = combos[k] || { person, method, receipt: false, statement: false };
+    if (kind === KIND.RECEIPT) c.receipt = true;
+    if (kind === KIND.CARD) c.statement = true;
+  };
+  loadFolderMaster_().forEach(f => f.methods.forEach(m => add(f.person, m, f.kind)));
+  tx.forEach(t => add(t.person, t.method, t.kind));
+  const persons = [];
+  Object.values(combos).forEach(c => { if (c.receipt && !persons.includes(c.person)) persons.push(c.person); });
+  const list = Object.values(combos).filter(c => c.method !== "不明" && c.person !== "銀行");
+  list.sort((a, b) => (PERSONS.indexOf(a.person) - PERSONS.indexOf(b.person)) ||
+    (METHODS.indexOf(a.method) - METHODS.indexOf(b.method)));
+  return { list, unknownPersons: persons.filter(p => p !== "銀行") };
+}
+
+function refreshCardTabs_(tx, byId, matches) {
+  const { list, unknownPersons } = cardCombos_(tx);
+  const byDate = (a, b) => String(a.date).localeCompare(String(b.date));
+
+  list.forEach(c => {
+    const mine = t => t.person === c.person && t.method === c.method;
+    const receipts = tx.filter(t => t.kind === KIND.RECEIPT && mine(t))
+      .map(t => ({ t, e: effective(t) })).map(x => Object.assign(x, { date: x.e.date })).sort(byDate);
+    const stmts = tx.filter(t => t.kind === KIND.CARD && mine(t))
+      .map(t => ({ t, e: effective(t) })).map(x => Object.assign(x, { date: x.e.date })).sort(byDate);
+
+    if (c.receipt) {
+      writeView_(cardTabName_(c.person, c.method, CARD_TAB.RECEIPT), CARD_RECEIPT_HEADERS,
+        receipts.map(({ t, e }) => [t.id, t.state, fmtYmdJa(e.date), e.merchant, amt_(e), e.currency, t.source_type,
+          sourceLink_(t), t.page, t.ocr_note, t.corr_sig ? "修正済み" : "", t.state_reason]),
+        receipts.map(({ t }) => STATE_COLORS[t.state] || "#ffffff"), "#1a73e8", { decision: false, frozenCols: 1 });
+    }
+    if (c.statement) {
+      writeView_(cardTabName_(c.person, c.method, CARD_TAB.STATEMENT), CARD_STATEMENT_HEADERS,
+        stmts.map(({ t, e }) => [t.id, t.state, fmtYmdJa(e.date), e.merchant, amt_(e), t.foreign_amount,
+          t.foreign_currency, t.special, sourceLink_(t), t.row_no, t.state_reason]),
+        stmts.map(({ t }) => STATE_COLORS[t.state] || "#ffffff"), "#0f9d58", { decision: false, frozenCols: 1 });
+    }
+    if (c.method === "現金") return;   // 現金はカード明細がないため突合結果タブを作らない
+
+    // 突合結果: 候補・承認済みの組は1行に横並び。相手のない取引も1行ずつ出す
+    const rows = [];
+    const shown = new Set();
+    matches.filter(m => (m.status === MATCH_STATUS.CANDIDATE || m.status === MATCH_STATUS.APPROVED) &&
+      byId[m.receipt_id] && byId[m.statement_id] && (mine(byId[m.receipt_id]) || mine(byId[m.statement_id])))
+      .forEach(m => {
+        const r = byId[m.receipt_id], s = byId[m.statement_id];
+        const er = effective(r), es = effective(s);
+        shown.add(r.id); shown.add(s.id);
+        rows.push({
+          date: er.date || es.date,
+          color: m.status === MATCH_STATUS.APPROVED ? "#ffffff" : (STATE_COLORS[m.kind] || "#ffffff"),
+          v: ["", "", m.match_id, "", m.status === MATCH_STATUS.APPROVED ? STATE.APPROVED : m.kind,
+            m.status === MATCH_STATUS.APPROVED ? m.decision_memo : r.state_reason, fmtYmdJa(er.date || es.date),
+            er.merchant, amt_(er), r.source_type, sourceLink_(r),
+            fmtYmdJa(es.date), es.merchant, amt_(es), sourceLink_(s),
+            m.amount_diff, m.date_diff, m.merchant_eval, r.next_check_month, r.id, s.id],
+        });
+      });
+    receipts.filter(({ t }) => !shown.has(t.id)).forEach(({ t, e }) => rows.push({
+      date: e.date, color: STATE_COLORS[t.state] || "#ffffff",
+      v: ["", "", "", t.id, t.state, t.state_reason, fmtYmdJa(e.date), e.merchant, amt_(e), t.source_type, sourceLink_(t),
+        "", "", "", "", "", "", "", t.next_check_month, t.id, ""],
+    }));
+    stmts.filter(({ t }) => !shown.has(t.id)).forEach(({ t, e }) => rows.push({
+      date: e.date, color: STATE_COLORS[t.state] || "#ffffff",
+      v: ["", "", "", t.id, t.state, t.state_reason, fmtYmdJa(e.date), "", "", "", "",
+        fmtYmdJa(e.date), e.merchant, amt_(e), sourceLink_(t), "", "", "", "", "", t.id],
+    }));
+    rows.sort(byDate);
+    writeView_(cardTabName_(c.person, c.method, CARD_TAB.RESULT), CARD_RESULT_HEADERS,
+      rows.map(r => r.v), rows.map(r => r.color), "#37474f", { frozenCols: 4 });
+  });
+
+  // カード不明: 支払手段「不明」のレシート（同額の明細があるカード、翌月確認、現金の可能性）
+  unknownPersons.forEach(p => {
+    const list = tx.filter(t => t.kind === KIND.RECEIPT && t.person === p && t.method === "不明")
+      .map(t => ({ t, e: effective(t) })).map(x => Object.assign(x, { date: x.e.date })).sort(byDate);
+    writeView_(cardTabName_(p, "", CARD_TAB.UNKNOWN), CARD_UNKNOWN_HEADERS,
+      list.map(({ t, e }) => ["", "", t.id, t.state, t.state_reason, fmtYmdJa(e.date), e.merchant, amt_(e), e.currency,
+        t.source_type, sourceLink_(t), t.next_check_month]),
+      list.map(({ t }) => STATE_COLORS[t.state] || "#ffffff"), "#8e24aa");
+  });
 }
 
 
@@ -1787,7 +1945,6 @@ function refreshViews_() {
 // ===== 判断を反映 =====
 
 function applyDecisions_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const mt = Table.open(SHEET.MATCH);
   const tx = Table.open(SHEET.TX);
   const hist = Table.open(SHEET.HISTORY);
@@ -1799,33 +1956,43 @@ function applyDecisions_() {
     approvedTx.add(m.receipt_id); approvedTx.add(m.statement_id);
   });
 
-  // 突合結果シート（突合単位）
-  readDecisions_(ss.getSheetByName(SHEET.RESULT), 3).forEach(d => {
-    const m = mt.find(x => x.match_id === d.id);
-    if (!m) return report.errors.push(d.id + ": 突合IDが台帳にありません");
-    if (m.status !== MATCH_STATUS.CANDIDATE) return report.errors.push(d.id + ": 既に「" + m.status + "」です");
-    if (d.decision === DECISION.APPROVE) {
-      if (approvedTx.has(m.receipt_id) || approvedTx.has(m.statement_id)) {
-        return report.errors.push(d.id + ": どちらかの取引が別の突合で承認済みです（1対多は「手動紐付け」を使用）");
-      }
-      approvedTx.add(m.receipt_id); approvedTx.add(m.statement_id);
-      m.status = MATCH_STATUS.APPROVED;
-      report.approved++;
-    } else {
-      m.status = MATCH_STATUS.REJECTED;
-      report.rejected++;
-    }
-    Object.assign(m, { decided_at: at, decided_by: who, decision_memo: d.memo });
-    mt.touch(m);
-    logHistory_(hist, "突合", m.match_id, d.decision, MATCH_STATUS.CANDIDATE + "（" + m.kind + "）", m.status, d.memo);
-  });
+  // 判断を入力できる全シート（突合結果・要確認一覧・先生＋カード別の突合結果・カード不明）
+  const decisions = [];
+  decisionSheets_().forEach(sh => readDecisions_(sh).forEach(d => decisions.push(d)));
+  const done = new Set();
 
-  // 要確認一覧シート（取引単位。理由メモ必須）
-  readDecisions_(ss.getSheetByName(SHEET.REVIEW), 3).forEach(d => {
-    if (!d.id) return report.errors.push("原本ファイル行には判断を入れられません（保存先・ファイルを修正してください）");
-    const t = tx.find(x => x.id === d.id);
-    if (!t) return report.errors.push(d.id + ": 取引IDが台帳にありません");
-    if (isBlank_(d.memo)) return report.errors.push(d.id + ": 個別の" + d.decision + "には判断メモ（理由）が必要です");
+  decisions.forEach(d => {
+    const where = "［" + d.sheet + "］";
+    if (d.matchId) {
+      // 突合単位
+      if (done.has(d.matchId)) return;
+      done.add(d.matchId);
+      const m = mt.find(x => x.match_id === d.matchId);
+      if (!m) return report.errors.push(where + d.matchId + ": 突合IDが台帳にありません");
+      if (m.status !== MATCH_STATUS.CANDIDATE) return report.errors.push(where + d.matchId + ": 既に「" + m.status + "」です");
+      if (d.decision === DECISION.APPROVE) {
+        if (approvedTx.has(m.receipt_id) || approvedTx.has(m.statement_id)) {
+          return report.errors.push(where + d.matchId + ": どちらかの取引が別の突合で承認済みです（1対多は「手動紐付け」を使用）");
+        }
+        approvedTx.add(m.receipt_id); approvedTx.add(m.statement_id);
+        m.status = MATCH_STATUS.APPROVED;
+        report.approved++;
+      } else {
+        m.status = MATCH_STATUS.REJECTED;
+        report.rejected++;
+      }
+      Object.assign(m, { decided_at: at, decided_by: who, decision_memo: d.memo });
+      mt.touch(m);
+      logHistory_(hist, "突合", m.match_id, d.decision, MATCH_STATUS.CANDIDATE + "（" + m.kind + "）", m.status, d.memo);
+      return;
+    }
+    // 取引単位（理由メモ必須）
+    if (!d.txId) return report.errors.push(where + "原本ファイル行には判断を入れられません（保存先・ファイルを修正してください）");
+    if (done.has(d.txId)) return;
+    done.add(d.txId);
+    const t = tx.find(x => x.id === d.txId);
+    if (!t) return report.errors.push(where + d.txId + ": 取引IDが台帳にありません");
+    if (isBlank_(d.memo)) return report.errors.push(where + d.txId + ": 個別の" + d.decision + "には判断メモ（理由）が必要です");
     const before = t.state;
     Object.assign(t, { decision: d.decision, reviewed_by: who, reviewed_at: at, review_memo: d.memo });
     tx.touch(t);
@@ -1837,11 +2004,18 @@ function applyDecisions_() {
   return report;
 }
 
-function readDecisions_(sh, idCol) {
+// 見出し「判断」「判断メモ」「突合ID」「取引ID」で読む（シートごとの列位置の違いを吸収）
+function readDecisions_(sh) {
   if (!sh || sh.getLastRow() < 2) return [];
-  return sh.getRange(2, 1, sh.getLastRow() - 1, idCol).getValues()
-    .filter(r => r[0] === DECISION.APPROVE || r[0] === DECISION.REJECT)
-    .map(r => ({ decision: r[0], memo: String(r[1] || "").trim(), id: String(r[idCol - 1] || "").trim() }));
+  const values = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const h = values[0].map(String);
+  const col = name => h.indexOf(name);
+  const cDec = col("判断"), cMemo = col("判断メモ"), cMatch = col("突合ID"), cTx = col("取引ID");
+  if (cDec < 0) return [];
+  const get = (r, c) => (c >= 0 ? String(r[c] || "").trim() : "");
+  return values.slice(1)
+    .filter(r => r[cDec] === DECISION.APPROVE || r[cDec] === DECISION.REJECT)
+    .map(r => ({ sheet: sh.getName(), decision: r[cDec], memo: get(r, cMemo), matchId: get(r, cMatch), txId: get(r, cTx) }));
 }
 
 // ===== OCR修正を反映（V8-02） =====
@@ -2156,7 +2330,9 @@ function menuInit() {
       "【最初に確認すること】\n" +
       "1. フォルダマスタ: V7のフォルダIDを登録済み。各フォルダ直下に「2026-09」形式の月フォルダを作って原本を入れる\n" +
       "2. セゾン・DC などが同居する明細フォルダは、ファイル名にカード名を入れる（例: 2026-09_セゾン.csv）\n" +
-      "3. カード明細列マスタ: 実ファイルの列名に合わせてカード別の行を追加\n\n" +
+      "3. カード明細列マスタ: 実ファイルの列名に合わせてカード別の行を追加\n" +
+      "4. 先生＋カード別に「_レシート」「_明細」「_突合結果」タブと「_カード不明」タブを作成済み\n" +
+      "5. ダウンロードした領収書・請求書はファイル名に「領収書」「請求書」等を入れる（原本区分の判定）\n\n" +
       "【月次の手順】\n① レシート読込 → ② カード明細読込 → 要確認一覧・突合結果で原本確認 → 判断を反映");
   });
 }

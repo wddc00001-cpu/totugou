@@ -6,7 +6,6 @@
 // ===== 判断を反映 =====
 
 function applyDecisions_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const mt = Table.open(SHEET.MATCH);
   const tx = Table.open(SHEET.TX);
   const hist = Table.open(SHEET.HISTORY);
@@ -18,33 +17,43 @@ function applyDecisions_() {
     approvedTx.add(m.receipt_id); approvedTx.add(m.statement_id);
   });
 
-  // 突合結果シート（突合単位）
-  readDecisions_(ss.getSheetByName(SHEET.RESULT), 3).forEach(d => {
-    const m = mt.find(x => x.match_id === d.id);
-    if (!m) return report.errors.push(d.id + ": 突合IDが台帳にありません");
-    if (m.status !== MATCH_STATUS.CANDIDATE) return report.errors.push(d.id + ": 既に「" + m.status + "」です");
-    if (d.decision === DECISION.APPROVE) {
-      if (approvedTx.has(m.receipt_id) || approvedTx.has(m.statement_id)) {
-        return report.errors.push(d.id + ": どちらかの取引が別の突合で承認済みです（1対多は「手動紐付け」を使用）");
-      }
-      approvedTx.add(m.receipt_id); approvedTx.add(m.statement_id);
-      m.status = MATCH_STATUS.APPROVED;
-      report.approved++;
-    } else {
-      m.status = MATCH_STATUS.REJECTED;
-      report.rejected++;
-    }
-    Object.assign(m, { decided_at: at, decided_by: who, decision_memo: d.memo });
-    mt.touch(m);
-    logHistory_(hist, "突合", m.match_id, d.decision, MATCH_STATUS.CANDIDATE + "（" + m.kind + "）", m.status, d.memo);
-  });
+  // 判断を入力できる全シート（突合結果・要確認一覧・先生＋カード別の突合結果・カード不明）
+  const decisions = [];
+  decisionSheets_().forEach(sh => readDecisions_(sh).forEach(d => decisions.push(d)));
+  const done = new Set();
 
-  // 要確認一覧シート（取引単位。理由メモ必須）
-  readDecisions_(ss.getSheetByName(SHEET.REVIEW), 3).forEach(d => {
-    if (!d.id) return report.errors.push("原本ファイル行には判断を入れられません（保存先・ファイルを修正してください）");
-    const t = tx.find(x => x.id === d.id);
-    if (!t) return report.errors.push(d.id + ": 取引IDが台帳にありません");
-    if (isBlank_(d.memo)) return report.errors.push(d.id + ": 個別の" + d.decision + "には判断メモ（理由）が必要です");
+  decisions.forEach(d => {
+    const where = "［" + d.sheet + "］";
+    if (d.matchId) {
+      // 突合単位
+      if (done.has(d.matchId)) return;
+      done.add(d.matchId);
+      const m = mt.find(x => x.match_id === d.matchId);
+      if (!m) return report.errors.push(where + d.matchId + ": 突合IDが台帳にありません");
+      if (m.status !== MATCH_STATUS.CANDIDATE) return report.errors.push(where + d.matchId + ": 既に「" + m.status + "」です");
+      if (d.decision === DECISION.APPROVE) {
+        if (approvedTx.has(m.receipt_id) || approvedTx.has(m.statement_id)) {
+          return report.errors.push(where + d.matchId + ": どちらかの取引が別の突合で承認済みです（1対多は「手動紐付け」を使用）");
+        }
+        approvedTx.add(m.receipt_id); approvedTx.add(m.statement_id);
+        m.status = MATCH_STATUS.APPROVED;
+        report.approved++;
+      } else {
+        m.status = MATCH_STATUS.REJECTED;
+        report.rejected++;
+      }
+      Object.assign(m, { decided_at: at, decided_by: who, decision_memo: d.memo });
+      mt.touch(m);
+      logHistory_(hist, "突合", m.match_id, d.decision, MATCH_STATUS.CANDIDATE + "（" + m.kind + "）", m.status, d.memo);
+      return;
+    }
+    // 取引単位（理由メモ必須）
+    if (!d.txId) return report.errors.push(where + "原本ファイル行には判断を入れられません（保存先・ファイルを修正してください）");
+    if (done.has(d.txId)) return;
+    done.add(d.txId);
+    const t = tx.find(x => x.id === d.txId);
+    if (!t) return report.errors.push(where + d.txId + ": 取引IDが台帳にありません");
+    if (isBlank_(d.memo)) return report.errors.push(where + d.txId + ": 個別の" + d.decision + "には判断メモ（理由）が必要です");
     const before = t.state;
     Object.assign(t, { decision: d.decision, reviewed_by: who, reviewed_at: at, review_memo: d.memo });
     tx.touch(t);
@@ -56,11 +65,18 @@ function applyDecisions_() {
   return report;
 }
 
-function readDecisions_(sh, idCol) {
+// 見出し「判断」「判断メモ」「突合ID」「取引ID」で読む（シートごとの列位置の違いを吸収）
+function readDecisions_(sh) {
   if (!sh || sh.getLastRow() < 2) return [];
-  return sh.getRange(2, 1, sh.getLastRow() - 1, idCol).getValues()
-    .filter(r => r[0] === DECISION.APPROVE || r[0] === DECISION.REJECT)
-    .map(r => ({ decision: r[0], memo: String(r[1] || "").trim(), id: String(r[idCol - 1] || "").trim() }));
+  const values = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  const h = values[0].map(String);
+  const col = name => h.indexOf(name);
+  const cDec = col("判断"), cMemo = col("判断メモ"), cMatch = col("突合ID"), cTx = col("取引ID");
+  if (cDec < 0) return [];
+  const get = (r, c) => (c >= 0 ? String(r[c] || "").trim() : "");
+  return values.slice(1)
+    .filter(r => r[cDec] === DECISION.APPROVE || r[cDec] === DECISION.REJECT)
+    .map(r => ({ sheet: sh.getName(), decision: r[cDec], memo: get(r, cMemo), matchId: get(r, cMatch), txId: get(r, cTx) }));
 }
 
 // ===== OCR修正を反映（V8-02） =====

@@ -68,6 +68,14 @@ test("レシート解析: 外貨と、円・外貨混在", () => {
   assert.equal(mix.amount, "", "通貨が確定できなければ金額は空");
 });
 
+test("原本区分: ファイル名で紙レシート／ダウンロードを判定", () => {
+  const pat = "領収|請求|invoice|receipt|download|ダウンロード|DL_";
+  assert.equal(gs.detectSourceType("院長_M-AMEX_2026-09.pdf", pat), "紙レシート（スキャン）");
+  assert.equal(gs.detectSourceType("BIGLOBE_請求書_202609.pdf", pat), "ダウンロード（領収書・請求書）");
+  assert.equal(gs.detectSourceType("Anthropic Invoice-1234.pdf", pat), "ダウンロード（領収書・請求書）");
+  assert.equal(gs.detectSourceType("x.pdf", "[壊れた"), "紙レシート（スキャン）", "不正な正規表現でも止まらない");
+});
+
 test("カード番号マスク", () => {
   assert.equal(gs.maskSensitive("カード 4980 1234 5678 9012"), "カード ****9012");
   assert.equal(gs.maskSensitive("TEL 088-123-4567"), "TEL 088-123-4567");

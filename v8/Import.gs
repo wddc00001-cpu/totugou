@@ -204,7 +204,7 @@ async function processReceiptFile_(ctx, file, entry, report) {
       ctx.files.touch(entry);
       return false;
     }
-    const tx = newReceiptTx_(entry, p);
+    const tx = newReceiptTx_(entry, p, ctx.settings);
     try {
       const text = driveOcr_(await pages.page(p));
       applyOcrResult_(tx, text);
@@ -230,10 +230,10 @@ async function processReceiptFile_(ctx, file, entry, report) {
   return true;
 }
 
-function newReceiptTx_(entry, page) {
+function newReceiptTx_(entry, page, settings) {
   return {
     id: newId_("R"), state: STATE.PENDING, state_reason: "", next_check_month: "",
-    kind: KIND.RECEIPT, person: entry.person, method: entry.method, target_month: entry.target_month,
+    kind: KIND.RECEIPT, source_type: detectSourceType(entry.file_name, settings.downloadPattern), person: entry.person, method: entry.method, target_month: entry.target_month,
     orig_date: "", orig_amount: "", currency: "JPY", orig_merchant: "",
     link: entry.link, page, row_no: "",
     foreign_amount: "", foreign_currency: "", jpy_amount: "", fx_basis: "",
@@ -329,7 +329,7 @@ function processStatementFile_(ctx, file, entry, master, report) {
     const bad = !!r.note;
     ctx.tx.insert({
       id: newId_("S"), state: bad ? STATE.OCR_CHECK : STATE.PENDING, state_reason: r.note, next_check_month: "",
-      kind: KIND.CARD, person: entry.person, method: entry.method, target_month: entry.target_month,
+      kind: KIND.CARD, source_type: SOURCE_TYPE.STATEMENT, person: entry.person, method: entry.method, target_month: entry.target_month,
       orig_date: r.date, orig_amount: r.amount, currency: "JPY", orig_merchant: r.merchant,
       link: entry.link, page: "", row_no: r.row_no,
       foreign_amount: r.foreign_amount, foreign_currency: r.foreign_currency, jpy_amount: r.amount,
