@@ -240,3 +240,44 @@ test("重複行: 別ファイルの同一行のみ。承認済みの行を優先
   const same = [row("x1", "A", "2026-09-18", 650), row("x2", "A", "2026-09-18", 650)];
   assert.deepEqual(arr(gs.findDuplicateStatementRows(same, () => false)), {}, "同じファイル内の同一行は重複にしない");
 });
+
+// ===== 写真明細（実データの Drive OCR 結果） =====
+const LC = require("./fixtures/lc-photo-ocr");
+
+test("写真明細: 行と金額が分かれて出るページも、数が一致すれば順番で対応付ける", () => {
+  const p6 = gs.parseStatementOcrText(LC.page6, "2026-08");
+  assert.equal(p6.paired, true);
+  assert.equal(p6.total, 3781601, "当月ご利用金額");
+  const rows = p6.rows.map(r => [r.date, r.amount, r.merchant]);
+  assert.deepEqual(arr(rows.slice(0, 2)), [["2026-07-01", 9405, "GOOGLE WORKSPACE WD-DC"], ["2026-07-01", 51224, "GOOGLE JAPAN"]]);
+  assert.deepEqual(arr(rows[4]), ["2026-07-01", 1034, "AMAZON.CO.JP"], "店名が先にまとめて出る部分");
+  assert.deepEqual(arr(rows[8]), ["2026-07-02", 12639, "カブシキガイシャアイプリー"]);
+  assert.equal(p6.rows[6].amount, 2750, "「2.750」も 2,750 と読む");
+  assert.match(p6.rows[6].note, /店名を読み取れません/, "日付だけの行（20090）も1行として数える");
+  assert.equal(p6.rows[2].date, "", "200701（260701の誤読）は期間外なので空欄");
+  assert.match(p6.rows[2].note, /読取: 200701/);
+});
+
+test("写真明細: 1ページ目（S が次行・回数列・手書きメモ）", () => {
+  const p1 = gs.parseStatementOcrText(LC.page1, "2026-08");
+  assert.equal(p1.paired, true);
+  assert.equal(p1.total, 3781601);
+  assert.deepEqual(arr(p1.rows.map(r => r.amount)), [940, 940, 173607, 4818, 908, 17093, 3628]);
+  assert.equal(p1.rows[6].date, "", "260007 は存在しない日付");
+  assert.ok(!p1.rows.some(r => /氏名|会員|口座/.test(r.merchant)), "見出し・個人情報の行を明細行にしない");
+});
+
+test("写真明細: 崩れたページは推測で金額を付けない", () => {
+  const p5 = gs.parseStatementOcrText(LC.page5, "2026-08");
+  assert.equal(p5.paired, false);
+  assert.ok(p5.rows.length > 0);
+  assert.ok(p5.rows.every(r => r.amount === "" && /対応付け不可/.test(r.note)));
+});
+
+test("写真明細: 1行に日付・店名・金額が並ぶ形式（ダウンロードPDF等）", () => {
+  const r = gs.parseStatementOcrText("ご利用明細\n2026/09/03 ローソン 1,200\n2026/09/05 ガスト 2,500\n当月ご請求金額 3,700", "2026-09");
+  assert.equal(r.paired, true);
+  assert.deepEqual(arr(r.rows.map(x => [x.date, x.amount, x.merchant])),
+    [["2026-09-03", 1200, "ローソン"], ["2026-09-05", 2500, "ガスト"]]);
+  assert.equal(r.total, 3700);
+});

@@ -293,3 +293,35 @@ test("期間が重なる明細ファイルの重複行は突合対象外。同�
   const tab = t.env.ss.getSheetByName("院長_M-AMEX_突合結果").records();
   assert.ok(!tab.some(x => x["結果"] === "重複行"), "突合結果タブに重複行は出さない");
 });
+
+test("写真の明細（法人LCの実データOCR）を取り込み、合計チェックとレシート突合ができる", async () => {
+  const LC = require("./fixtures/lc-photo-ocr");
+  const t = setup();
+  await init(t);
+  const aug = t.drive.subfolder(t.csvRoot, "2026-08");
+  const pages = { "S__1.jpg": LC.page1, "S__2.jpg": LC.page2, "S__5.jpg": LC.page5, "S__6.jpg": LC.page6 };
+  Object.keys(pages).forEach(n => t.drive.file(aug, n, "image/jpeg", n));
+  const recJul = t.drive.subfolder(t.recRoot, "2026-08");
+  t.drive.file(recJul, "google.jpg", "image/jpeg", "g");
+  t.ctx.driveOcr_ = blob => pages[blob.getName()] || "GOOGLE JAPAN\n2026/07/01\n合計 ¥51,224";
+
+  await t.gs.menuImportStatements();
+  const alert = lastAlert(t);
+  assert.match(alert, /写真・PDF明細: \d+行（要確認 \d+行）/);
+  assert.match(alert, /合計チェック/);
+  assert.match(alert, /不一致（読取 [\d,]+円 \/ 明細 3,781,601円/, "3・4ページ未取込・5ページ金額不明のため不一致");
+  const stmts = txs(t).filter(x => x["原本種別"] === "カード明細");
+  assert.ok(stmts.every(x => x["原本区分"] === "写真・PDF明細（OCR）"));
+  assert.ok(stmts.some(x => x["状態"] === "OCR要確認" && /対応付け不可/.test(x["状態理由"])), "5ページ目は要確認");
+  const f = t.env.ss.getSheetByName("取込確認").records().find(r => r["ファイル名"] === "S__6.jpg");
+  assert.equal(f["明細合計（読取）"], 3781601);
+  assert.match(f["メッセージ"], /｜合計チェック: 不一致/);
+
+  await t.gs.menuImportReceipts();
+  const r = txs(t).find(x => x["原本種別"] === "レシート/領収書/請求書");
+  assert.equal(r["状態"], "一致候補");
+  assert.match(r["状態理由"], /明細は写真OCR（原本で金額・日付を確認）/);
+  const row = t.env.ss.getSheetByName("院長_M-AMEX_突合結果").records().find(x => x["レシート取引ID"] === r["取引ID"]);
+  assert.equal(row["明細金額"], 51224);
+  assert.equal(row["明細原本"] !== "", true);
+});

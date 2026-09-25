@@ -267,7 +267,7 @@ function applyOcrResult_(tx, text) {
 
 // ===== ② カード明細読込 =====
 
-function importStatements_() {
+async function importStatements_() {
   const ctx = openImportContext_();
   const masters = loadCardMasters_();
   const report = { files: 0, rows: 0, classify: 0, errors: [], unsupported: [], folderErrors: [], interrupted: false };
@@ -279,9 +279,10 @@ function importStatements_() {
     if (reg.entry.status === IMPORT_STATUS.CLASSIFY && reg.action === "skip") report.classify++;
     if (reg.action !== "process") continue;
     report.files++;
-    processStatementFile_(ctx, item.file, reg.entry, masters.get(reg.entry.method), report);
+    await processStatementFile_(ctx, item.file, reg.entry, masters.get(reg.entry.method), report);
     flushImportContext_(ctx);
   }
+  report.photoChecks = checkPhotoStatementTotals_(ctx);
   flushImportContext_(ctx);
   return report;
 }
@@ -295,7 +296,10 @@ function readStatementValues_(file, master) {
   return null;
 }
 
-function processStatementFile_(ctx, file, entry, master, report) {
+const PHOTO_STATEMENT_MIMES = ["image/jpeg", "image/png", "image/gif", "image/heic", "image/tiff", "application/pdf"];
+
+async function processStatementFile_(ctx, file, entry, master, report) {
+  if (PHOTO_STATEMENT_MIMES.includes(file.getMimeType())) return processPhotoStatement_(ctx, file, entry, master, report);
   let values;
   try {
     values = readStatementValues_(file, master);
@@ -306,9 +310,7 @@ function processStatementFile_(ctx, file, entry, master, report) {
   }
   if (values === null) {
     entry.status = IMPORT_STATUS.UNSUPPORTED;
-    entry.message = file.getMimeType() === "application/pdf"
-      ? "PDF明細は実データで精度確認後に対応（V8-03 条件付き）。CSV/xlsx で保存してください"
-      : "未対応の形式です（CSV / xlsx / Googleスプレッドシート）";
+    entry.message = "未対応の形式です（CSV / xlsx / Googleスプレッドシート / 画像 / PDF）";
     report.unsupported.push(entry.file_name);
   }
   if (!values) {
@@ -346,6 +348,110 @@ function processStatementFile_(ctx, file, entry, master, report) {
   entry.message = res.rows.length ? "" : "見出し行（" + res.headerRow + "行目）の後にデータ行がありません";
   ctx.files.touch(entry);
   report.rows += res.rows.length;
+}
+
+// ===== 写真・PDFのカード明細（Drive OCR。外部AIには送らない） =====
+//
+// ページごとに OCR → parseStatementOcrText。金額は「ページ内の順番」で対応付けるため、
+// すべての行に「写真OCR」と明記し、突合の承認時に原本で確認する前提とする。
+// 同じ月フォルダの写真明細をまとめて、読み取った金額の合計と明細に印字された合計を照合する。
+
+async function processPhotoStatement_(ctx, file, entry, master, report) {
+  let pages;
+  try {
+    pages = file.getMimeType() === "application/pdf"
+      ? await openPdfPages_(file.getBlob(), ctx.settings.pdfLibUrl)
+      : { count: 1, page: async () => file.getBlob() };
+  } catch (e) {
+    entry.status = IMPORT_STATUS.ERROR;
+    entry.message = "PDFを開けません: " + e.message;
+    ctx.files.touch(entry);
+    report.errors.push(entry.file_name + ": " + entry.message);
+    return;
+  }
+  const special = master.special_pattern ? new RegExp(master.special_pattern) : null;
+  const txs = [];
+  const failed = [];
+  let total = "";
+  for (let p = 1; p <= pages.count; p++) {
+    let parsed;
+    try {
+      parsed = parseStatementOcrText(driveOcr_(await pages.page(p)), entry.target_month);
+    } catch (e) {
+      failed.push(p + "ページ: " + e.message);
+      continue;
+    }
+    if (parsed.total !== "" && (total === "" || parsed.total > total)) total = parsed.total;
+    parsed.rows.forEach(r => {
+      const note = r.note || "写真OCR: ページ内の順番で金額を対応付け（原本で確認）";
+      const sp = special && (r.merchant.match(special) || [])[0];
+      txs.push({
+        id: newId_("S"), state: r.note ? STATE.OCR_CHECK : STATE.PENDING, state_reason: r.note, next_check_month: "",
+        kind: KIND.CARD, source_type: SOURCE_TYPE.PHOTO, person: entry.person, method: entry.method,
+        target_month: entry.target_month, orig_date: r.date, orig_amount: r.amount, currency: "JPY",
+        orig_merchant: r.merchant, link: entry.link, page: p, row_no: r.row_no,
+        foreign_amount: "", foreign_currency: "", jpy_amount: r.amount, fx_basis: "",
+        special: sp || "", ocr_status: r.note ? "要確認" : "成功", ocr_note: note, evidence: "",
+        file_id: entry.file_id, version: entry.version, superseded: false, created_at: nowText_(),
+      });
+    });
+  }
+  if (!txs.length && failed.length) {
+    entry.status = IMPORT_STATUS.ERROR;
+    entry.message = "OCR失敗: " + failed.join(" / ");
+    ctx.files.touch(entry);
+    report.errors.push(entry.file_name + ": " + entry.message);
+    return;
+  }
+  txs.forEach(t => ctx.tx.insert(t));
+  const need = txs.filter(t => t.state === STATE.OCR_CHECK).length;
+  entry.status = IMPORT_STATUS.DONE;
+  entry.pages_total = pages.count;
+  entry.pages_done = pages.count;
+  entry.tx_count = txs.length;
+  entry.ocr_total = total;
+  entry.failed_pages = failed.map(f => f.split("ページ")[0]).join(",");
+  entry.message = "写真OCR: " + txs.length + "行（要確認 " + need + "行）" + (failed.length ? "／OCR失敗 " + failed.join(" / ") : "");
+  ctx.files.touch(entry);
+  report.rows += txs.length;
+  report.photoRows = (report.photoRows || 0) + txs.length;
+  report.photoNeedCheck = (report.photoNeedCheck || 0) + need;
+}
+
+/**
+ * 同じ 人物・カード・対象月 の写真明細について、読み取った金額の合計と明細に印字された合計を照合する。
+ * 結果は各ファイルの「メッセージ」末尾に「｜合計チェック: …」として毎回書き直す。
+ */
+function checkPhotoStatementTotals_(ctx) {
+  const groups = {};
+  ctx.files.all().filter(f => f.kind === KIND.CARD && f.status === IMPORT_STATUS.DONE &&
+    PHOTO_STATEMENT_MIMES.includes(f.mime_type)).forEach(f => {
+    const k = f.person + "|" + f.method + "|" + f.target_month;
+    (groups[k] = groups[k] || { files: [], total: "" }).files.push(f);
+    if (!isBlank_(f.ocr_total) && (groups[k].total === "" || Number(f.ocr_total) > groups[k].total)) {
+      groups[k].total = Number(f.ocr_total);
+    }
+  });
+  const out = [];
+  Object.keys(groups).forEach(k => {
+    const g = groups[k];
+    const ids = new Set(g.files.map(f => f.file_id + "#" + f.version));
+    const rows = ctx.tx.all().filter(t => ids.has(t.file_id + "#" + t.version) && !isTrue_(t.superseded));
+    const known = rows.filter(t => !isBlank_(t.corr_amount) || !isBlank_(t.orig_amount));
+    const sum = known.reduce((a, t) => a + (parseAmount(isBlank_(t.corr_amount) ? t.orig_amount : t.corr_amount) || 0), 0);
+    const missing = rows.length - known.length;
+    let msg;
+    if (g.total === "") msg = "明細の合計金額を読み取れず照合できません（読取合計 " + sum.toLocaleString("ja-JP") + "円）";
+    else if (sum === g.total && !missing) msg = "一致（" + sum.toLocaleString("ja-JP") + "円）";
+    else msg = "不一致（読取 " + sum.toLocaleString("ja-JP") + "円 / 明細 " + g.total.toLocaleString("ja-JP") +
+      "円、差 " + (g.total - sum).toLocaleString("ja-JP") + "円、金額不明 " + missing + "行）";
+    g.files.forEach(f => {
+      f.message = String(f.message || "").split("｜合計チェック")[0] + "｜合計チェック: " + msg;
+      ctx.files.touch(f);
+    });
+    out.push(k.replace(/\|/g, " ") + ": " + msg);
+  });
+  return out;
 }
 
 // ===== OCR失敗ページ・エラーの再実行（当該ファイル・ページだけ） =====

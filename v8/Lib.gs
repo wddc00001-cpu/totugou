@@ -291,6 +291,102 @@ function extractStatementRows(rows, master) {
   return { rows: out, headerRow: h.headerIndex + 1, cols: c };
 }
 
+// ===== 写真・スキャンPDFのカード明細（OCRテキスト）解析 =====
+//
+// 1ページ = 1回のOCR。Drive OCR は表を列ごとに読むことがあり「日付＋店名」の行と金額が離れて出てくる。
+// そこで「日付＋店名」の行と、売上金額（S 付きの金額）をそれぞれ順番に集め、
+//   - 数が一致したページだけ順番で対応付ける（それでも原本確認が前提）
+//   - 数が合わないページは金額を空欄にして OCR要確認（推測で組み合わせない）
+// 日付は明細の期間（対象月の前後）から外れるもの（例: 260701 → 200701 の誤読）は空欄にする。
+
+const STMT_ROW_START_ = /^[~\-\\*\s]*(\d{6}|\d{2,4}[\/.\-]\d{1,2}[\/.\-]\d{1,2}|\d{2,5})\s*(?=[A-Za-z\u3040-\u30ff\u4e00-\u9fff*＊])(.*)$/;
+const STMT_NOT_ROW_ = /(\d\s*年|\d+\s*月\s*\d+\s*日|円|%|件|レート|現地通貨|作成日|会員番号|口座|利用可能枠)/;
+// 金額は1,000以上なら区切り付き（明細の印字）。区切りのない4桁以上の数字は日付の誤読として扱う
+const STMT_AMOUNT_LINE_ = /^((?:\d{1,3}(?:[,.]\s?\d{3})+)|\d{1,3})\s*([S8§$]?)(?:\s*現地通貨.*|\s+[\d.,\/][\d\s.,\/]*)?$/;
+const STMT_DATE_ONLY_ = /^[~\-\\*\s]*(2\d{4,5})$/;   // 店名が読めなかった行（例: 20090）
+const STMT_TOTAL_LINE_ = /(当月ご利用金額|当月お支払合計金額|ご請求金額|今回お支払金額)/;
+
+function parseStmtAmount_(s) {
+  const v = Number(String(s).replace(/[,.\s]/g, ""));
+  return isFinite(v) ? v : NaN;
+}
+
+function parseStmtDate_(raw, targetMonth) {
+  const s = String(raw);
+  let ymd = "";
+  if (/^\d{6}$/.test(s)) ymd = makeYmd_(s.slice(0, 2), s.slice(2, 4), s.slice(4, 6));
+  else if (/[\/.\-]/.test(s)) ymd = toYmd(s);
+  if (!ymd) return "";
+  if (targetMonth) {
+    const m = monthOf(ymd);
+    if (m < addMonths(targetMonth, -4) || m > addMonths(targetMonth, 1)) return "";   // 明細期間から外れる → 誤読扱い
+  }
+  return ymd;
+}
+
+/**
+ * @return { rows: [{row_no, date, amount, merchant, note}], total, saleAmounts, paired }
+ */
+function parseStatementOcrText(text, targetMonth) {
+  const lines = nfkc_(text).split(/\r?\n/).map(l => l.replace(/\\([+*~\-\[\]])/g, "$1").trim()).filter(Boolean);
+  const starts = [], tokens = [];
+  let total = "";
+  lines.forEach((line, i) => {
+    if (STMT_TOTAL_LINE_.test(line)) {
+      if (total === "") {
+        for (let k = i; k < Math.min(lines.length, i + 3); k++) {
+          const m = lines[k].replace(STMT_TOTAL_LINE_, "").match(/(\d{1,3}(?:[,.]\s?\d{3})+)/);
+          if (m) { total = parseStmtAmount_(m[1]); break; }
+        }
+      }
+      return;
+    }
+    if (total !== "" && i > 0 && STMT_TOTAL_LINE_.test(lines[i - 1])) return;   // 合計行の金額は明細行にしない
+    const am = line.match(STMT_AMOUNT_LINE_);
+    if (am) {
+      const s = !!am[2] || /^[S8]$/.test(lines[i + 1] || "");
+      if (parseStmtAmount_(am[1]) < 100 && !s) return;   // 支払回数（1・01）などの小さい数字
+      tokens.push({ i, value: parseStmtAmount_(am[1]), s });
+      return;
+    }
+    const only = line.match(STMT_DATE_ONLY_);
+    if (only) { starts.push({ raw: only[1], merchant: "", inlineAmount: "" }); return; }
+    const st = line.match(STMT_ROW_START_);
+    if (st && !STMT_NOT_ROW_.test(line)) {
+      const rest = st[2].trim();
+      const inline = rest.match(/^(.*?)\s+((?:\d{1,3}(?:[,.]\s?\d{3})+)|\d{1,3})\s*[S8]?$/);
+      starts.push({
+        raw: st[1], merchant: (inline ? inline[1] : rest).slice(0, 60),
+        inlineAmount: inline ? parseStmtAmount_(inline[2]) : "",
+      });
+    }
+  });
+
+  // 売上金額: S 付き、または直後（4行以内）に同じ金額（お支払金額）が繰り返されるもの。繰り返し側は数えない
+  const sales = [];
+  const used = new Set();
+  tokens.forEach((t, k) => {
+    if (used.has(k)) return;
+    const twin = tokens.findIndex((u, j) => j > k && !used.has(j) && u.i - t.i <= 4 && u.value === t.value);
+    if (!t.s && twin < 0) return;
+    if (twin >= 0) used.add(twin);
+    sales.push(t.value);
+  });
+
+  const allInline = starts.length > 0 && starts.every(s => s.inlineAmount !== "");
+  const paired = allInline || (starts.length > 0 && starts.length === sales.length);
+  const rows = starts.map((s, i) => {
+    const date = parseStmtDate_(s.raw, targetMonth);
+    const amount = allInline ? s.inlineAmount : (paired ? sales[i] : "");
+    const notes = [];
+    if (!s.merchant) notes.push("店名を読み取れません");
+    if (!date) notes.push("日付を読み取れません（読取: " + s.raw + "）");
+    if (amount === "") notes.push("金額との対応付け不可（行 " + starts.length + " 件・金額 " + sales.length + " 件）");
+    return { row_no: i + 1, date, amount, merchant: s.merchant, note: notes.join("／") };
+  });
+  return { rows, total, saleAmounts: sales, paired };
+}
+
 // ===== レシートOCRテキスト解析（1ページ = 最大1取引。V8-01） =====
 
 const TOTAL_LINE_ = /(合計|お買上|お買い上げ|ご請求|領収金額|お支払金額|支払金額|ご利用金額|grand\s*total|total|amount\s*due|balance\s*due)/i;
@@ -566,6 +662,7 @@ function runMatchingEngine(input) {
       const me = merchantEval(er.merchant, eff[s.id].merchant);
       let reason = "金額・日付・人物・支払手段が一意に一致（未承認）";
       if (me === "差あり") reason += "／店舗名差あり（レシート: " + er.merchant + " ／ 明細: " + eff[s.id].merchant + "）";
+      if (s.source_type === SOURCE_TYPE.PHOTO) reason += "／明細は写真OCR（原本で金額・日付を確認）";
       set(r, STATE.CANDIDATE, reason);
       set(s, STATE.CANDIDATE, "レシート " + r.id + " と一意に一致（未承認）");
       addCand(r, s, STATE.CANDIDATE);

@@ -102,6 +102,7 @@ const SOURCE_TYPE = {
   PAPER:     "紙レシート（スキャン）",
   DOWNLOAD:  "ダウンロード（領収書・請求書）",
   STATEMENT: "カード明細",
+  PHOTO:     "写真・PDF明細（OCR）",
 };
 
 // 先生＋カード別タブ: 「院長_M-AMEX_突合結果」（レシート｜明細｜結果を横並び）、支払手段不明は「院長_カード不明」。RECEIPT/STATEMENT は旧版タブの片付け用
@@ -459,6 +460,102 @@ function extractStatementRows(rows, master) {
   return { rows: out, headerRow: h.headerIndex + 1, cols: c };
 }
 
+// ===== 写真・スキャンPDFのカード明細（OCRテキスト）解析 =====
+//
+// 1ページ = 1回のOCR。Drive OCR は表を列ごとに読むことがあり「日付＋店名」の行と金額が離れて出てくる。
+// そこで「日付＋店名」の行と、売上金額（S 付きの金額）をそれぞれ順番に集め、
+//   - 数が一致したページだけ順番で対応付ける（それでも原本確認が前提）
+//   - 数が合わないページは金額を空欄にして OCR要確認（推測で組み合わせない）
+// 日付は明細の期間（対象月の前後）から外れるもの（例: 260701 → 200701 の誤読）は空欄にする。
+
+const STMT_ROW_START_ = /^[~\-\\*\s]*(\d{6}|\d{2,4}[\/.\-]\d{1,2}[\/.\-]\d{1,2}|\d{2,5})\s*(?=[A-Za-z\u3040-\u30ff\u4e00-\u9fff*＊])(.*)$/;
+const STMT_NOT_ROW_ = /(\d\s*年|\d+\s*月\s*\d+\s*日|円|%|件|レート|現地通貨|作成日|会員番号|口座|利用可能枠)/;
+// 金額は1,000以上なら区切り付き（明細の印字）。区切りのない4桁以上の数字は日付の誤読として扱う
+const STMT_AMOUNT_LINE_ = /^((?:\d{1,3}(?:[,.]\s?\d{3})+)|\d{1,3})\s*([S8§$]?)(?:\s*現地通貨.*|\s+[\d.,\/][\d\s.,\/]*)?$/;
+const STMT_DATE_ONLY_ = /^[~\-\\*\s]*(2\d{4,5})$/;   // 店名が読めなかった行（例: 20090）
+const STMT_TOTAL_LINE_ = /(当月ご利用金額|当月お支払合計金額|ご請求金額|今回お支払金額)/;
+
+function parseStmtAmount_(s) {
+  const v = Number(String(s).replace(/[,.\s]/g, ""));
+  return isFinite(v) ? v : NaN;
+}
+
+function parseStmtDate_(raw, targetMonth) {
+  const s = String(raw);
+  let ymd = "";
+  if (/^\d{6}$/.test(s)) ymd = makeYmd_(s.slice(0, 2), s.slice(2, 4), s.slice(4, 6));
+  else if (/[\/.\-]/.test(s)) ymd = toYmd(s);
+  if (!ymd) return "";
+  if (targetMonth) {
+    const m = monthOf(ymd);
+    if (m < addMonths(targetMonth, -4) || m > addMonths(targetMonth, 1)) return "";   // 明細期間から外れる → 誤読扱い
+  }
+  return ymd;
+}
+
+/**
+ * @return { rows: [{row_no, date, amount, merchant, note}], total, saleAmounts, paired }
+ */
+function parseStatementOcrText(text, targetMonth) {
+  const lines = nfkc_(text).split(/\r?\n/).map(l => l.replace(/\\([+*~\-\[\]])/g, "$1").trim()).filter(Boolean);
+  const starts = [], tokens = [];
+  let total = "";
+  lines.forEach((line, i) => {
+    if (STMT_TOTAL_LINE_.test(line)) {
+      if (total === "") {
+        for (let k = i; k < Math.min(lines.length, i + 3); k++) {
+          const m = lines[k].replace(STMT_TOTAL_LINE_, "").match(/(\d{1,3}(?:[,.]\s?\d{3})+)/);
+          if (m) { total = parseStmtAmount_(m[1]); break; }
+        }
+      }
+      return;
+    }
+    if (total !== "" && i > 0 && STMT_TOTAL_LINE_.test(lines[i - 1])) return;   // 合計行の金額は明細行にしない
+    const am = line.match(STMT_AMOUNT_LINE_);
+    if (am) {
+      const s = !!am[2] || /^[S8]$/.test(lines[i + 1] || "");
+      if (parseStmtAmount_(am[1]) < 100 && !s) return;   // 支払回数（1・01）などの小さい数字
+      tokens.push({ i, value: parseStmtAmount_(am[1]), s });
+      return;
+    }
+    const only = line.match(STMT_DATE_ONLY_);
+    if (only) { starts.push({ raw: only[1], merchant: "", inlineAmount: "" }); return; }
+    const st = line.match(STMT_ROW_START_);
+    if (st && !STMT_NOT_ROW_.test(line)) {
+      const rest = st[2].trim();
+      const inline = rest.match(/^(.*?)\s+((?:\d{1,3}(?:[,.]\s?\d{3})+)|\d{1,3})\s*[S8]?$/);
+      starts.push({
+        raw: st[1], merchant: (inline ? inline[1] : rest).slice(0, 60),
+        inlineAmount: inline ? parseStmtAmount_(inline[2]) : "",
+      });
+    }
+  });
+
+  // 売上金額: S 付き、または直後（4行以内）に同じ金額（お支払金額）が繰り返されるもの。繰り返し側は数えない
+  const sales = [];
+  const used = new Set();
+  tokens.forEach((t, k) => {
+    if (used.has(k)) return;
+    const twin = tokens.findIndex((u, j) => j > k && !used.has(j) && u.i - t.i <= 4 && u.value === t.value);
+    if (!t.s && twin < 0) return;
+    if (twin >= 0) used.add(twin);
+    sales.push(t.value);
+  });
+
+  const allInline = starts.length > 0 && starts.every(s => s.inlineAmount !== "");
+  const paired = allInline || (starts.length > 0 && starts.length === sales.length);
+  const rows = starts.map((s, i) => {
+    const date = parseStmtDate_(s.raw, targetMonth);
+    const amount = allInline ? s.inlineAmount : (paired ? sales[i] : "");
+    const notes = [];
+    if (!s.merchant) notes.push("店名を読み取れません");
+    if (!date) notes.push("日付を読み取れません（読取: " + s.raw + "）");
+    if (amount === "") notes.push("金額との対応付け不可（行 " + starts.length + " 件・金額 " + sales.length + " 件）");
+    return { row_no: i + 1, date, amount, merchant: s.merchant, note: notes.join("／") };
+  });
+  return { rows, total, saleAmounts: sales, paired };
+}
+
 // ===== レシートOCRテキスト解析（1ページ = 最大1取引。V8-01） =====
 
 const TOTAL_LINE_ = /(合計|お買上|お買い上げ|ご請求|領収金額|お支払金額|支払金額|ご利用金額|grand\s*total|total|amount\s*due|balance\s*due)/i;
@@ -734,6 +831,7 @@ function runMatchingEngine(input) {
       const me = merchantEval(er.merchant, eff[s.id].merchant);
       let reason = "金額・日付・人物・支払手段が一意に一致（未承認）";
       if (me === "差あり") reason += "／店舗名差あり（レシート: " + er.merchant + " ／ 明細: " + eff[s.id].merchant + "）";
+      if (s.source_type === SOURCE_TYPE.PHOTO) reason += "／明細は写真OCR（原本で金額・日付を確認）";
       set(r, STATE.CANDIDATE, reason);
       set(s, STATE.CANDIDATE, "レシート " + r.id + " と一意に一致（未承認）");
       addCand(r, s, STATE.CANDIDATE);
@@ -853,6 +951,7 @@ FIELDS[SHEET.FILES] = [
   ["status", "取込状態"], ["message", "メッセージ"], ["pages_total", "総ページ"], ["pages_done", "処理済ページ"],
   ["failed_pages", "失敗ページ"], ["tx_count", "取引数"], ["imported_at", "取込日時"],
   ["mime_type", "形式"], ["content_hash", "内容ハッシュ"], ["drive_updated", "Drive更新日時"], ["folder_id", "格納フォルダID"],
+  ["ocr_total", "明細合計（読取）"],
 ];
 
 FIELDS[SHEET.TX] = [
@@ -1482,7 +1581,7 @@ function applyOcrResult_(tx, text) {
 
 // ===== ② カード明細読込 =====
 
-function importStatements_() {
+async function importStatements_() {
   const ctx = openImportContext_();
   const masters = loadCardMasters_();
   const report = { files: 0, rows: 0, classify: 0, errors: [], unsupported: [], folderErrors: [], interrupted: false };
@@ -1494,9 +1593,10 @@ function importStatements_() {
     if (reg.entry.status === IMPORT_STATUS.CLASSIFY && reg.action === "skip") report.classify++;
     if (reg.action !== "process") continue;
     report.files++;
-    processStatementFile_(ctx, item.file, reg.entry, masters.get(reg.entry.method), report);
+    await processStatementFile_(ctx, item.file, reg.entry, masters.get(reg.entry.method), report);
     flushImportContext_(ctx);
   }
+  report.photoChecks = checkPhotoStatementTotals_(ctx);
   flushImportContext_(ctx);
   return report;
 }
@@ -1510,7 +1610,10 @@ function readStatementValues_(file, master) {
   return null;
 }
 
-function processStatementFile_(ctx, file, entry, master, report) {
+const PHOTO_STATEMENT_MIMES = ["image/jpeg", "image/png", "image/gif", "image/heic", "image/tiff", "application/pdf"];
+
+async function processStatementFile_(ctx, file, entry, master, report) {
+  if (PHOTO_STATEMENT_MIMES.includes(file.getMimeType())) return processPhotoStatement_(ctx, file, entry, master, report);
   let values;
   try {
     values = readStatementValues_(file, master);
@@ -1521,9 +1624,7 @@ function processStatementFile_(ctx, file, entry, master, report) {
   }
   if (values === null) {
     entry.status = IMPORT_STATUS.UNSUPPORTED;
-    entry.message = file.getMimeType() === "application/pdf"
-      ? "PDF明細は実データで精度確認後に対応（V8-03 条件付き）。CSV/xlsx で保存してください"
-      : "未対応の形式です（CSV / xlsx / Googleスプレッドシート）";
+    entry.message = "未対応の形式です（CSV / xlsx / Googleスプレッドシート / 画像 / PDF）";
     report.unsupported.push(entry.file_name);
   }
   if (!values) {
@@ -1561,6 +1662,110 @@ function processStatementFile_(ctx, file, entry, master, report) {
   entry.message = res.rows.length ? "" : "見出し行（" + res.headerRow + "行目）の後にデータ行がありません";
   ctx.files.touch(entry);
   report.rows += res.rows.length;
+}
+
+// ===== 写真・PDFのカード明細（Drive OCR。外部AIには送らない） =====
+//
+// ページごとに OCR → parseStatementOcrText。金額は「ページ内の順番」で対応付けるため、
+// すべての行に「写真OCR」と明記し、突合の承認時に原本で確認する前提とする。
+// 同じ月フォルダの写真明細をまとめて、読み取った金額の合計と明細に印字された合計を照合する。
+
+async function processPhotoStatement_(ctx, file, entry, master, report) {
+  let pages;
+  try {
+    pages = file.getMimeType() === "application/pdf"
+      ? await openPdfPages_(file.getBlob(), ctx.settings.pdfLibUrl)
+      : { count: 1, page: async () => file.getBlob() };
+  } catch (e) {
+    entry.status = IMPORT_STATUS.ERROR;
+    entry.message = "PDFを開けません: " + e.message;
+    ctx.files.touch(entry);
+    report.errors.push(entry.file_name + ": " + entry.message);
+    return;
+  }
+  const special = master.special_pattern ? new RegExp(master.special_pattern) : null;
+  const txs = [];
+  const failed = [];
+  let total = "";
+  for (let p = 1; p <= pages.count; p++) {
+    let parsed;
+    try {
+      parsed = parseStatementOcrText(driveOcr_(await pages.page(p)), entry.target_month);
+    } catch (e) {
+      failed.push(p + "ページ: " + e.message);
+      continue;
+    }
+    if (parsed.total !== "" && (total === "" || parsed.total > total)) total = parsed.total;
+    parsed.rows.forEach(r => {
+      const note = r.note || "写真OCR: ページ内の順番で金額を対応付け（原本で確認）";
+      const sp = special && (r.merchant.match(special) || [])[0];
+      txs.push({
+        id: newId_("S"), state: r.note ? STATE.OCR_CHECK : STATE.PENDING, state_reason: r.note, next_check_month: "",
+        kind: KIND.CARD, source_type: SOURCE_TYPE.PHOTO, person: entry.person, method: entry.method,
+        target_month: entry.target_month, orig_date: r.date, orig_amount: r.amount, currency: "JPY",
+        orig_merchant: r.merchant, link: entry.link, page: p, row_no: r.row_no,
+        foreign_amount: "", foreign_currency: "", jpy_amount: r.amount, fx_basis: "",
+        special: sp || "", ocr_status: r.note ? "要確認" : "成功", ocr_note: note, evidence: "",
+        file_id: entry.file_id, version: entry.version, superseded: false, created_at: nowText_(),
+      });
+    });
+  }
+  if (!txs.length && failed.length) {
+    entry.status = IMPORT_STATUS.ERROR;
+    entry.message = "OCR失敗: " + failed.join(" / ");
+    ctx.files.touch(entry);
+    report.errors.push(entry.file_name + ": " + entry.message);
+    return;
+  }
+  txs.forEach(t => ctx.tx.insert(t));
+  const need = txs.filter(t => t.state === STATE.OCR_CHECK).length;
+  entry.status = IMPORT_STATUS.DONE;
+  entry.pages_total = pages.count;
+  entry.pages_done = pages.count;
+  entry.tx_count = txs.length;
+  entry.ocr_total = total;
+  entry.failed_pages = failed.map(f => f.split("ページ")[0]).join(",");
+  entry.message = "写真OCR: " + txs.length + "行（要確認 " + need + "行）" + (failed.length ? "／OCR失敗 " + failed.join(" / ") : "");
+  ctx.files.touch(entry);
+  report.rows += txs.length;
+  report.photoRows = (report.photoRows || 0) + txs.length;
+  report.photoNeedCheck = (report.photoNeedCheck || 0) + need;
+}
+
+/**
+ * 同じ 人物・カード・対象月 の写真明細について、読み取った金額の合計と明細に印字された合計を照合する。
+ * 結果は各ファイルの「メッセージ」末尾に「｜合計チェック: …」として毎回書き直す。
+ */
+function checkPhotoStatementTotals_(ctx) {
+  const groups = {};
+  ctx.files.all().filter(f => f.kind === KIND.CARD && f.status === IMPORT_STATUS.DONE &&
+    PHOTO_STATEMENT_MIMES.includes(f.mime_type)).forEach(f => {
+    const k = f.person + "|" + f.method + "|" + f.target_month;
+    (groups[k] = groups[k] || { files: [], total: "" }).files.push(f);
+    if (!isBlank_(f.ocr_total) && (groups[k].total === "" || Number(f.ocr_total) > groups[k].total)) {
+      groups[k].total = Number(f.ocr_total);
+    }
+  });
+  const out = [];
+  Object.keys(groups).forEach(k => {
+    const g = groups[k];
+    const ids = new Set(g.files.map(f => f.file_id + "#" + f.version));
+    const rows = ctx.tx.all().filter(t => ids.has(t.file_id + "#" + t.version) && !isTrue_(t.superseded));
+    const known = rows.filter(t => !isBlank_(t.corr_amount) || !isBlank_(t.orig_amount));
+    const sum = known.reduce((a, t) => a + (parseAmount(isBlank_(t.corr_amount) ? t.orig_amount : t.corr_amount) || 0), 0);
+    const missing = rows.length - known.length;
+    let msg;
+    if (g.total === "") msg = "明細の合計金額を読み取れず照合できません（読取合計 " + sum.toLocaleString("ja-JP") + "円）";
+    else if (sum === g.total && !missing) msg = "一致（" + sum.toLocaleString("ja-JP") + "円）";
+    else msg = "不一致（読取 " + sum.toLocaleString("ja-JP") + "円 / 明細 " + g.total.toLocaleString("ja-JP") +
+      "円、差 " + (g.total - sum).toLocaleString("ja-JP") + "円、金額不明 " + missing + "行）";
+    g.files.forEach(f => {
+      f.message = String(f.message || "").split("｜合計チェック")[0] + "｜合計チェック: " + msg;
+      ctx.files.touch(f);
+    });
+    out.push(k.replace(/\|/g, " ") + ": " + msg);
+  });
+  return out;
 }
 
 // ===== OCR失敗ページ・エラーの再実行（当該ファイル・ページだけ） =====
@@ -2254,13 +2459,15 @@ function menuImportReceipts() {
 
 function menuImportStatements() {
   return guarded_("② カード明細読込", async ui => {
-    const rep = importStatements_();
+    const rep = await importStatements_();
     const r = rematchAndRefresh_();   // 翌月確認の取引もここで優先的に再判定される
     ui.alert(
       (rep.interrupted ? "⏸ 時間制限のため途中で中断しました。もう一度実行してください。\n\n" : "✅ カード明細読込完了\n\n") +
       "処理ファイル: " + rep.files + "件 / 明細行: " + rep.rows + "行\n分類要確認: " + rep.classify + "件" +
       listText_("⚠️ 読み込めなかったファイル（必須列不足など）", rep.errors) +
       listText_("⚠️ 未対応形式", rep.unsupported) + listText_("⚠️ フォルダ", rep.folderErrors) +
+      (rep.photoRows ? "\n\n📷 写真・PDF明細: " + rep.photoRows + "行（要確認 " + rep.photoNeedCheck + "行）" : "") +
+      listText_("📷 写真・PDF明細の合計チェック", rep.photoChecks || []) +
       "\n\n【突合状態】\n" + summaryText_(r));
   });
 }

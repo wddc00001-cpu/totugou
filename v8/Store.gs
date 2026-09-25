@@ -13,6 +13,7 @@ FIELDS[SHEET.FILES] = [
   ["status", "取込状態"], ["message", "メッセージ"], ["pages_total", "総ページ"], ["pages_done", "処理済ページ"],
   ["failed_pages", "失敗ページ"], ["tx_count", "取引数"], ["imported_at", "取込日時"],
   ["mime_type", "形式"], ["content_hash", "内容ハッシュ"], ["drive_updated", "Drive更新日時"], ["folder_id", "格納フォルダID"],
+  ["ocr_total", "明細合計（読取）"],
 ];
 
 FIELDS[SHEET.TX] = [

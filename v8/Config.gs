@@ -97,6 +97,7 @@ const SOURCE_TYPE = {
   PAPER:     "紙レシート（スキャン）",
   DOWNLOAD:  "ダウンロード（領収書・請求書）",
   STATEMENT: "カード明細",
+  PHOTO:     "写真・PDF明細（OCR）",
 };
 
 // 先生＋カード別タブ: 「院長_M-AMEX_突合結果」（レシート｜明細｜結果を横並び）、支払手段不明は「院長_カード不明」。RECEIPT/STATEMENT は旧版タブの片付け用

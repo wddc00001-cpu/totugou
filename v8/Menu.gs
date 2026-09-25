@@ -93,13 +93,15 @@ function menuImportReceipts() {
 
 function menuImportStatements() {
   return guarded_("② カード明細読込", async ui => {
-    const rep = importStatements_();
+    const rep = await importStatements_();
     const r = rematchAndRefresh_();   // 翌月確認の取引もここで優先的に再判定される
     ui.alert(
       (rep.interrupted ? "⏸ 時間制限のため途中で中断しました。もう一度実行してください。\n\n" : "✅ カード明細読込完了\n\n") +
       "処理ファイル: " + rep.files + "件 / 明細行: " + rep.rows + "行\n分類要確認: " + rep.classify + "件" +
       listText_("⚠️ 読み込めなかったファイル（必須列不足など）", rep.errors) +
       listText_("⚠️ 未対応形式", rep.unsupported) + listText_("⚠️ フォルダ", rep.folderErrors) +
+      (rep.photoRows ? "\n\n📷 写真・PDF明細: " + rep.photoRows + "行（要確認 " + rep.photoNeedCheck + "行）" : "") +
+      listText_("📷 写真・PDF明細の合計チェック", rep.photoChecks || []) +
       "\n\n【突合状態】\n" + summaryText_(r));
   });
 }
