@@ -375,3 +375,21 @@ test("レシートの読み直し: 旧版を残して新しい読取ルールで
   const files = t.env.ss.getSheetByName("取込確認").records();
   assert.deepEqual(files.map(f => [f["処理版"], f["取込状態"]]), [[1, "旧版"], [2, "完了"]]);
 });
+
+test("PDF: スキャンしたPDFはページごと、ダウンロードした領収書PDFは複数ページでも1件", async () => {
+  const t = setup();
+  await init(t);
+  t.drive.file(t.recMonth, "scan_202609.pdf", "application/pdf", "%PDF-scan");
+  t.drive.file(t.recMonth, "Anthropic_領収書_202609.pdf", "application/pdf", "%PDF-dl");
+  t.ctx.openPdfPages_ = async blob => ({ count: 3, page: async i => ({ page: i, getName: () => blob.getName() }) });
+  t.ctx.driveOcr_ = blob => blob.page
+    ? ["", "ローソン\n2026/09/01\n合計 ¥300", "ガスト\n2026/09/02\n合計 ¥1,200", "薬局\n2026/09/03\n合計 ¥980"][blob.page]
+    : "Anthropic, PBC\nReceipt\nDate paid September 7, 2026\nTotal ¥3,300\n(page 2) Terms";
+  await t.gs.menuImportReceipts();
+  const rs = txs(t);
+  const scan = rs.filter(x => /scan/.test(x["原本リンク"]) || x["原本区分"] === "紙レシート（スキャン）");
+  assert.equal(scan.length, 3, "スキャンPDFは3ページ＝3件");
+  const dl = rs.filter(x => x["原本区分"] === "ダウンロード（領収書・請求書）");
+  assert.equal(dl.length, 1, "ダウンロードPDFは1件");
+  assert.equal(dl[0]["原本_金額"], 3300);
+});

@@ -196,7 +196,10 @@ async function importReceipts_() {
 
 async function openReceiptPages_(ctx, file, entry, report) {
   try {
-    const pages = file.getMimeType() === "application/pdf"
+    // ダウンロードした領収書・請求書（ファイル名で判定）は複数ページでも1枚の書類として読む。
+    // スキャンしたPDFは1ページ = 1レシートとしてページごとに読む
+    const asOneDocument = detectSourceType(entry.file_name, ctx.settings.downloadPattern) === SOURCE_TYPE.DOWNLOAD;
+    const pages = file.getMimeType() === "application/pdf" && !asOneDocument
       ? await openPdfPages_(file.getBlob(), ctx.settings.pdfLibUrl)
       : (blob => ({ count: 1, page: async () => blob }))(file.getBlob());
     entry.pages_total = pages.count;
@@ -387,10 +390,20 @@ async function processPhotoStatement_(ctx, file, entry, master, report) {
   const txs = [];
   const failed = [];
   let total = "";
+  // ページをまとめて並列にOCR
+  const texts = [];
+  const batch = Math.max(1, ctx.settings.ocrBatch);
+  for (let start = 1; start <= pages.count; start += batch) {
+    const blobs = [];
+    for (let p = start; p < Math.min(pages.count + 1, start + batch); p++) blobs.push(await pages.page(p));
+    driveOcrBatch_(blobs).forEach(r => texts.push(r));
+  }
   for (let p = 1; p <= pages.count; p++) {
     let parsed;
     try {
-      parsed = parseStatementOcrText(driveOcr_(await pages.page(p)), entry.target_month);
+      const r = texts[p - 1];
+      if (r.error) throw new Error(r.error);
+      parsed = parseStatementOcrText(r.text, entry.target_month);
     } catch (e) {
       failed.push(p + "ページ: " + e.message);
       continue;
