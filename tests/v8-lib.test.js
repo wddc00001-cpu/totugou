@@ -203,3 +203,16 @@ test("数式インジェクション防止", () => {
   assert.equal(g.plainCell_("ローソン"), "ローソン");
   assert.equal(g.plainCell_(1200), 1200);
 });
+
+test("1ファイル版 dist/V8_all.gs が v8/ と一致し、単体で読み込める", () => {
+  const fs = require("node:fs");
+  const { execFileSync } = require("node:child_process");
+  const path = require("node:path");
+  const dist = path.join(__dirname, "..", "dist", "V8_all.gs");
+  const before = fs.readFileSync(dist, "utf8");
+  execFileSync("node", [path.join(__dirname, "..", "scripts", "build.js")]);
+  assert.equal(fs.readFileSync(dist, "utf8"), before, "npm run build を実行してから commit してください");
+  const g = loadGs(["dist/V8_all.gs"]);
+  assert.equal(typeof g.onOpen, "function");
+  assert.equal(typeof g.menuImportReceipts, "function");
+});
