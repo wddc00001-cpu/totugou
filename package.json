@@ -1,0 +1,8 @@
+{
+  "name": "wada-dental-totugou",
+  "private": true,
+  "description": "和田歯科医院 経理突合システム（Google Apps Script）",
+  "scripts": {
+    "test": "TZ=Asia/Tokyo node --test tests/*.test.js"
+  }
+}
