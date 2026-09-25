@@ -19,7 +19,12 @@ function applyDecisions_() {
 
   // 判断を入力できる全シート（突合結果・要確認一覧・先生＋カード別の突合結果・カード不明）
   const decisions = [];
-  decisionSheets_().forEach(sh => readDecisions_(sh).forEach(d => decisions.push(d)));
+  decisionSheets_().forEach(sh => {
+    const ds = readDecisions_(sh);
+    ds.forEach(d => decisions.push(d));
+    // 入力された判断は台帳へ移すので画面からは消す（反映できなかったものはアラートで再入力を促す）
+    if (ds.length) sh.getRange(2, 1, sh.getLastRow() - 1, 2).clearContent();
+  });
   const done = new Set();
 
   decisions.forEach(d => {

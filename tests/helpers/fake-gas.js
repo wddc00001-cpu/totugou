@@ -51,11 +51,16 @@ class FakeRange {
       const rr = this.r + i - 1;
       this.sheet.grid[rr] = this.sheet.grid[rr] || [];
       for (let k = this.sheet.grid[rr].length; k < this.c + j - 1; k++) this.sheet.grid[rr][k] = "";
-      this.sheet.grid[rr][this.c + j - 1] = v;
+      // Sheets と同じく先頭の「'」は文字列指定として取り除く
+      this.sheet.grid[rr][this.c + j - 1] = typeof v === "string" && v.charAt(0) === "'" ? v.slice(1) : v;
     }));
     return chainable(this);
   }
   setValue(v) { return this.setValues([[v]]); }
+  clearContent() {
+    const blank = Array.from({ length: this.nr }, () => Array(this.nc).fill(""));
+    return this.setValues(blank);
+  }
   protect() { return chainable({}); }
 }
 
@@ -118,6 +123,8 @@ function makeGas() {
   const prompts = [];
   const folders = {};
   const files = {};
+  const propStore = {};
+  const docProps = { getProperty: k => (k in propStore ? propStore[k] : null), setProperty: (k, v) => { propStore[k] = String(v); } };
   const fmt = (d, tz, pattern) => {
     const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
       timeZone: tz || "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit",
@@ -147,8 +154,10 @@ function makeGas() {
     Utilities: {
       formatDate: fmt,
       getUuid: () => crypto.randomUUID(),
-      DigestAlgorithm: { SHA_256: "sha256" },
-      computeDigest: (alg, bytes) => Array.from(new Int8Array(crypto.createHash("sha256").update(Buffer.from(bytes)).digest())),
+      DigestAlgorithm: { SHA_256: "sha256", MD5: "md5" },
+      Charset: { UTF_8: "utf8" },
+      computeDigest: (alg, data) => Array.from(new Int8Array(crypto.createHash(alg).update(
+        typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data)).digest())),
       newBlob: (data, type, name) => new FakeBlob(typeof data === "string" ? Buffer.from(data) : Buffer.from(data), type, name),
       sleep: () => {},
     },
@@ -158,6 +167,7 @@ function makeGas() {
       getScriptTimeZone: () => "Asia/Tokyo",
     },
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
+    PropertiesService: { getDocumentProperties: () => docProps },
     DriveApp: {
       getFolderById: id => { if (!folders[id]) throw new Error("no folder " + id); return folders[id]; },
       getFileById: id => { if (!files[id]) throw new Error("no file " + id); return files[id]; },

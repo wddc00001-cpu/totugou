@@ -281,3 +281,34 @@ test("写真明細: 1行に日付・店名・金額が並ぶ形式（ダウン�
     [["2026-09-03", 1200, "ローソン"], ["2026-09-05", 2500, "ガスト"]]);
   assert.equal(r.total, 3700);
 });
+
+// ===== レシート写真（実データの Drive OCR 結果） =====
+const RC = require("./fixtures/receipt-photo-ocr");
+
+test("レシート写真: 「¥26, 290」の空白入りの金額を正しく読む", () => {
+  const r = gs.parseReceiptText(RC.mitsukoshi);
+  assert.equal(r.amount, 26290);
+  assert.equal(r.date, "2026-07-05");
+  assert.equal(r.merchant, "MITSUKOSHI");
+});
+
+test("レシート写真: 手書き領収書の「¥11,990.-」を金額として読む", () => {
+  const r = gs.parseReceiptText(RC.onward);
+  assert.equal(r.amount, 11990);
+  assert.equal(r.date, "2026-07-05");
+});
+
+test("レシート写真: 1枚に複数レシートが写っていれば金額を空欄にして要確認", () => {
+  for (const k of ["twoReceipts", "threeReceipts"]) {
+    const r = gs.parseReceiptText(RC[k]);
+    assert.equal(r.amount, "", k);
+    assert.match(r.notes.join(), /複数のレシート/, k);
+  }
+});
+
+test("対象月: Date でも文字でも YYYY-MM に正規化", () => {
+  assert.equal(gs.toYm(new Date(2026, 7, 1)), "2026-08");
+  assert.equal(gs.toYm("'2026-08"), "2026-08");
+  assert.equal(gs.toYm("2026/8"), "2026-08");
+  assert.equal(gs.addMonths(new Date(2026, 11, 1), 1), "2027-01");
+});

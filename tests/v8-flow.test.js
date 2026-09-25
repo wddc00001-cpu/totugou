@@ -32,6 +32,10 @@ function setup() {
     count: 10,
     page: async i => ({ page: i, getName: () => blob.getName() }),
   });
+  // 本番は driveOcrBatch_（並列OCR）。テストでは1枚ずつの driveOcr_ を差し替えて使う
+  ctx.driveOcrBatch_ = blobs => blobs.map(b => {
+    try { return { text: ctx.driveOcr_(b) }; } catch (e) { return { error: e.message }; }
+  });
   ctx.driveOcr_ = blob => {
     if (blob.page === 3 && failPage3) throw new Error("Drive OCR 失敗 HTTP 500");
     return blob.page ? PAGES[blob.page] : "";
@@ -324,4 +328,50 @@ test("写真の明細（法人LCの実データOCR）を取り込み、合計チ
   const row = t.env.ss.getSheetByName("院長_M-AMEX_突合結果").records().find(x => x["レシート取引ID"] === r["取引ID"]);
   assert.equal(row["明細金額"], 51224);
   assert.equal(row["明細原本"] !== "", true);
+});
+
+test("シートが対象月「2026-08」を日付に自動変換しても動き、再取込で版が増えない（ym.split エラーの再発防止）", async () => {
+  const t = setup();
+  await init(t);
+  t.drive.file(t.recMonth, "a.jpg", "image/jpeg", "a");
+  t.ctx.driveOcr_ = () => "ローソン\n2026/09/28\n合計 ¥500";
+  await t.gs.menuImportReceipts();
+  // Google スプレッドシートの自動変換を再現: 対象月・翌月確認月のセルを Date にする
+  for (const name of ["取引台帳", "取込確認"]) {
+    const sh = t.env.ss.getSheetByName(name);
+    const h = sh.grid[0];
+    ["対象月", "翌月確認月"].forEach(col => {
+      const c = h.indexOf(col);
+      if (c < 0) return;
+      sh.grid.slice(1).forEach(row => {
+        const m = String(row[c] || "").match(/^(\d{4})-(\d{2})$/);
+        if (m) row[c] = new Date(Number(m[1]), Number(m[2]) - 1, 1);
+      });
+    });
+  }
+  await t.gs.menuImportReceipts();
+  assert.doesNotMatch(lastAlert(t), /エラー/);
+  assert.equal(t.env.ss.getSheetByName("取込確認").records().length, 1, "同じファイルを新しい版として取り込み直さない");
+  const r = txs(t)[0];
+  assert.equal(r["状態"], "翌月確認");
+  assert.equal(t.gs.toYm(r["翌月確認月"]), "2026-10");
+});
+
+test("レシートの読み直し: 旧版を残して新しい読取ルールで取り込み直す", async () => {
+  const t = setup();
+  await init(t);
+  t.drive.file(t.recMonth, "a.jpg", "image/jpeg", "a");
+  t.ctx.driveOcr_ = () => "ローソン\n2026/09/03\n合計 ¥26";
+  await t.gs.menuImportReceipts();
+  t.ctx.driveOcr_ = () => "ローソン\n2026/09/03\n合計 ¥2,600";
+  t.env.prompts.push("2026-09");
+  await t.gs.menuReread();
+  assert.match(lastAlert(t), /1件のレシートを読み直し待ち/);
+  await t.gs.menuImportReceipts();
+  const all = txs(t);
+  assert.equal(all.length, 2);
+  assert.equal(all.find(x => x["旧版"] === true)["原本_金額"], 26, "旧版は残す");
+  assert.equal(all.find(x => x["旧版"] !== true)["原本_金額"], 2600);
+  const files = t.env.ss.getSheetByName("取込確認").records();
+  assert.deepEqual(files.map(f => [f["処理版"], f["取込状態"]]), [[1, "旧版"], [2, "完了"]]);
 });

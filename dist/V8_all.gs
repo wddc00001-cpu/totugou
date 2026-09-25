@@ -115,6 +115,8 @@ const DEFAULT_SETTINGS = [
   ["日付要確認の検出幅(日)",  45,  "同額でこの日数以内なら『日付要確認』として相手候補を示す"],
   ["翌月確認の猶予(月)",      1,   "翌月確認の対象月からこの月数を過ぎても相手が無ければ『期限超過』"],
   ["処理時間上限(秒)",        270, "Apps Script の6分制限に対する安全マージン。超えたら中断し、再実行で続きから再開"],
+  ["画面更新の予備時間(秒)",  90,  "読込はこの秒数を残して打ち切り、突合と画面更新の時間を確保する"],
+  ["OCR同時処理数",           6,   "レシート写真を何枚ずつまとめて読み取るか（多いほど速いが、失敗時の再試行も増える）"],
   ["ダウンロード判定キーワード", "領収|請求|invoice|receipt|download|ダウンロード|DL_",
    "ファイル名にこの語が入っていれば原本区分を『ダウンロード』、なければ『紙レシート』にする（取引台帳で手修正可）"],
   ["pdf-lib URL", "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js", "一括PDFのページ分割に使用"],
@@ -290,8 +292,17 @@ function monthOf(ymd) {
   return ymd ? ymd.slice(0, 7) : "";
 }
 
+// 対象月の正規化: シートが「2026-08」を日付に自動変換しても "2026-08" に戻す
+function toYm(v) {
+  if (isBlank_(v)) return "";
+  if (isDate_(v)) return v.getFullYear() + "-" + pad2_(v.getMonth() + 1);
+  const s = nfkc_(v).trim().replace(/^'/, "");
+  const m = s.match(/^(\d{4})[-\/年.](\d{1,2})/);
+  return m ? m[1] + "-" + pad2_(Number(m[2])) : s;
+}
+
 function addMonths(ym, n) {
-  const [y, m] = ym.split("-").map(Number);
+  const [y, m] = toYm(ym).split("-").map(Number);
   const t = y * 12 + (m - 1) + n;
   return Math.floor(t / 12) + "-" + pad2_((t % 12) + 1);
 }
@@ -596,7 +607,8 @@ function detectCurrency_(text) {
 
 function parseReceiptText(text) {
   const r = { date: "", amount: "", currency: "JPY", merchant: "", notes: [] };
-  const s = nfkc_(text);
+  // OCR で「26, 290」「1. 400」のように区切りの後に空白が入るのを詰める
+  const s = nfkc_(text).replace(/(\d)([,.])\s+(\d{3})(?!\d)/g, "$1$2$3");
   if (!s.trim()) { r.notes.push("OCRテキストが空です"); return r; }
   const lines = s.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
@@ -624,9 +636,20 @@ function parseReceiptText(text) {
     const v = nums.length ? nums[nums.length - 1] : NaN;
     if (v > 0 && !totals.some(t => sameAmount_(t, v))) totals.push(v);
   });
+  // 領収書の金額表記「¥11,990-」「¥11,990.-」
+  const receiptMarks = [];
+  const reMark = /[¥￥\\]\s*(\d{1,3}(?:,\d{3})+|\d+)\s*(?:\.-|-|ー|―)(?!\d)/g;
+  let mk;
+  while ((mk = reMark.exec(s))) {
+    const v = Number(mk[1].replace(/,/g, ""));
+    if (v > 0 && !receiptMarks.includes(v)) receiptMarks.push(v);
+  }
   if (totals.length === 1) r.amount = totals[0];
   else if (totals.length > 1) {
     r.notes.push("複数の合計金額を検出: " + totals.join(" / ") + "（1ページに複数レシートの可能性。自動で選びません）");
+  } else if (receiptMarks.length === 1) {
+    r.amount = receiptMarks[0];
+    r.notes.push("領収書の金額表記（¥…-）を採用");
   } else {
     const yen = [];
     const re = /[¥￥]\s*(\d{1,3}(?:,\d{3})+|\d+)|(\d{1,3}(?:,\d{3})+|\d+)\s*円/g;
@@ -635,7 +658,7 @@ function parseReceiptText(text) {
       const v = Number((m[1] || m[2]).replace(/,/g, ""));
       if (v > 0 && !yen.includes(v)) yen.push(v);
     }
-    if (yen.length === 1 && r.currency === "JPY") {
+    if (yen.length === 1 && yen[0] >= 100 && r.currency === "JPY") {
       r.amount = yen[0];
       r.notes.push("合計行なし（金額表記が1つのみのため採用）");
     } else {
@@ -647,8 +670,29 @@ function parseReceiptText(text) {
     r.notes.push("通貨が確定できないため金額は空欄");
   }
 
-  // 日付
+  // 1枚に複数のレシートが写っていないか（日付・時刻・登録番号・金額表記が複数）
   const dates = findDates(s);
+  const times = [];
+  const reTime = /(?<![\d:])([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?(?![\d:])/g;
+  let tm;
+  while ((tm = reTime.exec(s))) { const k = Number(tm[1]) + ":" + tm[2]; if (!times.includes(k)) times.push(k); }
+  const regNos = [];
+  (s.match(/T\d{13}/g) || []).forEach(x => { if (!regNos.includes(x)) regNos.push(x); });
+  const hints = [];
+  if (dates.length > 1) hints.push("日付" + dates.length + "件");
+  if (times.length > 1) hints.push("時刻" + times.length + "件");
+  if (regNos.length > 1) hints.push("登録番号" + regNos.length + "件");
+  if (receiptMarks.length > 1) hints.push("領収金額" + receiptMarks.length + "件");
+  if (r.amount !== "" && totals.length <= 1 && receiptMarks.length === 1) {
+    const other = yenAmounts_(s).filter(v => v !== r.amount && !isTaxPartOf_(v, r.amount, s));
+    if (other.length) hints.push("別の金額 ¥" + other.slice(0, 3).map(v => v.toLocaleString("ja-JP")).join("・¥"));
+  }
+  if (hints.length && r.amount !== "") {
+    r.amount = "";
+    r.notes.push("1枚に複数のレシートが写っている可能性（" + hints.join("・") + "）。1枚ずつ撮影・スキャンするか「取引を分割」で入力");
+  }
+
+  // 日付
   if (dates.length) {
     r.date = dates[0];
     if (dates.length > 1) r.notes.push("複数の日付を検出: " + dates.map(fmtYmdJa).join(" / ") + "（先頭を採用）");
@@ -661,6 +705,29 @@ function parseReceiptText(text) {
     !/^[\d\s,.:¥￥$\-*#()]+$/.test(l) && !/(tel|電話|http|www\.)/i.test(l)
   ) || "").slice(0, 60);
   return r;
+}
+
+function yenAmounts_(s) {
+  const out = [];
+  const re = /[¥￥]\s*(\d{1,3}(?:,\d{3})+|\d+)/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const v = Number(m[1].replace(/,/g, ""));
+    if (v > 0 && !out.includes(v)) out.push(v);
+  }
+  return out;
+}
+
+// 合計に付随する金額（税抜対象額・消費税・小計・0円のお釣り等）か
+function isTaxPartOf_(v, total, s) {
+  if (v >= total) return false;
+  const rest = total - v;
+  const all = yenAmounts_(s).concat((s.match(/\d{1,3}(?:,\d{3})+/g) || []).map(x => Number(x.replace(/,/g, ""))));
+  if (all.includes(rest)) return true;                        // 税抜額＋消費税＝合計
+  const rate = v / total;
+  if (Math.abs(rate - 10 / 110) < 0.002 || Math.abs(rate - 8 / 108) < 0.002) return true;   // 内消費税
+  if (Math.abs(v - Math.round(total / 1.1)) <= 1 || Math.abs(v - Math.round(total / 1.08)) <= 1) return true;   // 税抜対象額
+  return false;
 }
 
 // カード番号など12〜19桁の数字列を末尾4桁以外マスク
@@ -1029,7 +1096,10 @@ class Table {
 
   toObj_(v, i) {
     const o = { _i: i };
-    this.fields.forEach(([key]) => { o[key] = v[this.col[key]]; });
+    this.fields.forEach(([key]) => {
+      const x = v[this.col[key]];
+      o[key] = MONTH_KEYS_.includes(key) ? toYm(x) : x;
+    });
     return o;
   }
 
@@ -1053,7 +1123,7 @@ class Table {
     const v = base ? base.slice() : new Array(this.width).fill("");
     this.fields.forEach(([key]) => {
       const x = o[key];
-      v[this.col[key]] = x === undefined || x === null ? "" : plainCell_(x);
+      v[this.col[key]] = x === undefined || x === null ? "" : (TEXT_KEYS_.includes(key) ? asText_(x) : plainCell_(x));
     });
     return v;
   }
@@ -1081,6 +1151,15 @@ class Table {
       this.added = [];
     }
   }
+}
+
+// シートに自動変換させたくない列（月・ハッシュ）は文字として書き込む
+const MONTH_KEYS_ = ["target_month", "next_check_month"];
+const TEXT_KEYS_ = MONTH_KEYS_.concat(["content_hash"]);
+
+function asText_(v) {
+  const s = String(v);
+  return s === "" || s.charAt(0) === "'" ? s : "'" + s;
 }
 
 // OCR・CSV 由来の文字列が「=」で始まっても数式として評価させない
@@ -1119,6 +1198,8 @@ function loadSettings_() {
     dateWindow:    num("日付要確認の検出幅(日)", 45),
     graceMonths:   num("翌月確認の猶予(月)", 1),
     timeBudgetMs:  num("処理時間上限(秒)", 270) * 1000,
+    reserveMs:     num("画面更新の予備時間(秒)", 90) * 1000,
+    ocrBatch:      num("OCR同時処理数", 6),
     downloadPattern: String(isBlank_(map["ダウンロード判定キーワード"])
       ? DEFAULT_SETTINGS.find(r => r[0] === "ダウンロード判定キーワード")[1] : map["ダウンロード判定キーワード"]),
     pdfLibUrl:     String(map["pdf-lib URL"] || DEFAULT_SETTINGS.find(r => r[0] === "pdf-lib URL")[1]),
@@ -1231,12 +1312,66 @@ function trashQuietly_(id) {
 
 // 画像・1ページPDF → OCRテキスト（Drive OCR。外部AIには送信しない）
 function driveOcr_(blob) {
-  const id = uploadConverted_(blob, "application/vnd.google-apps.document", "&ocrLanguage=ja");
+  const r = driveOcrBatch_([blob])[0];
+  if (r.error) throw new Error(r.error);
+  return r.text;
+}
+
+function multipartRequest_(blob, googleMime, extraQuery) {
+  const boundary = "wada_v8_" + Utilities.getUuid();
+  const meta = JSON.stringify({ name: "v8_tmp_" + Date.now(), mimeType: googleMime });
+  const head =
+    "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + meta +
+    "\r\n--" + boundary + "\r\nContent-Type: " + blob.getContentType() + "\r\n\r\n";
+  const tail = "\r\n--" + boundary + "--";
+  return {
+    url: "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id" + (extraQuery || ""),
+    method: "post",
+    contentType: "multipart/related; boundary=" + boundary,
+    payload: Utilities.newBlob(head).getBytes().concat(blob.getBytes()).concat(Utilities.newBlob(tail).getBytes()),
+    headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+    muteHttpExceptions: true,
+  };
+}
+
+/**
+ * 複数の画像・1ページPDFをまとめてOCR（アップロード・テキスト取得・一時ファイル削除を並列実行）
+ * @return [{ text } | { error }]（入力と同じ順）
+ */
+function driveOcrBatch_(blobs) {
+  if (!blobs.length) return [];
+  const auth = { Authorization: "Bearer " + ScriptApp.getOAuthToken() };
+  const out = blobs.map(() => ({}));
+  const ups = UrlFetchApp.fetchAll(blobs.map(b => multipartRequest_(b, "application/vnd.google-apps.document", "&ocrLanguage=ja")));
+  const ids = ups.map((res, i) => {
+    if (res.getResponseCode() >= 300) {
+      out[i].error = "Drive OCR 失敗 HTTP " + res.getResponseCode() + " " + res.getContentText().slice(0, 120);
+      return "";
+    }
+    return JSON.parse(res.getContentText()).id;
+  });
+  const live = ids.map((id, i) => ({ id, i })).filter(x => x.id);
   try {
-    return DocumentApp.openById(id).getBody().getText();
+    const texts = UrlFetchApp.fetchAll(live.map(x => ({
+      url: "https://www.googleapis.com/drive/v3/files/" + x.id + "/export?mimeType=text/plain",
+      headers: auth, muteHttpExceptions: true,
+    })));
+    texts.forEach((res, k) => {
+      const i = live[k].i;
+      if (res.getResponseCode() >= 300) out[i].error = "OCRテキスト取得失敗 HTTP " + res.getResponseCode();
+      else out[i].text = res.getContentText("UTF-8").replace(/^\uFEFF/, "");
+    });
   } finally {
-    trashQuietly_(id);
+    // 一時ドキュメントは成功・失敗にかかわらずゴミ箱へ
+    try {
+      UrlFetchApp.fetchAll(live.map(x => ({
+        url: "https://www.googleapis.com/drive/v3/files/" + x.id, method: "patch",
+        contentType: "application/json", payload: JSON.stringify({ trashed: true }),
+        headers: auth, muteHttpExceptions: true,
+      })));
+    } catch (_) {}
   }
+  return out;
 }
 
 // xlsx → 2次元配列（Date はそのまま Date で返る）
@@ -1466,7 +1601,7 @@ function flushImportContext_(ctx) {
 }
 
 function timeUp_(ctx) {
-  return Date.now() - ctx.started > ctx.settings.timeBudgetMs;
+  return Date.now() - ctx.started > ctx.settings.timeBudgetMs - ctx.settings.reserveMs;
 }
 
 // ===== ① レシート読込（ページ単位OCR） =====
@@ -1474,7 +1609,17 @@ function timeUp_(ctx) {
 async function importReceipts_() {
   const ctx = openImportContext_();
   const report = { files: 0, pages: 0, failedPages: 0, classify: 0, errors: [], interrupted: false, folderErrors: [] };
+  const batchSize = Math.max(1, ctx.settings.ocrBatch);
+  let tasks = [];
 
+  const runTasks = async () => {
+    if (!tasks.length) return;
+    await ocrReceiptTasks_(ctx, tasks, report);
+    tasks = [];
+    flushImportContext_(ctx);
+  };
+
+  outer:
   for (const item of listSourceFiles_(KIND.RECEIPT)) {
     if (item.folderError) { report.folderErrors.push(item.folderError); continue; }
     if (!RECEIPT_MIMES.includes(item.file.getMimeType())) continue;
@@ -1483,65 +1628,69 @@ async function importReceipts_() {
     if (reg.entry.status === IMPORT_STATUS.CLASSIFY && reg.action === "skip") report.classify++;
     if (reg.action !== "process") continue;
     report.files++;
-    const done = await processReceiptFile_(ctx, item.file, reg.entry, report);
-    flushImportContext_(ctx);
-    if (!done) { report.interrupted = true; break; }
+    const pages = await openReceiptPages_(ctx, item.file, reg.entry, report);
+    if (!pages) continue;
+    for (let p = Number(reg.entry.pages_done || 0) + 1; p <= pages.count; p++) {
+      tasks.push({ entry: reg.entry, pages, p });
+      if (tasks.length >= batchSize) {
+        await runTasks();
+        if (timeUp_(ctx)) { report.interrupted = true; break outer; }
+      }
+    }
   }
+  if (!report.interrupted || tasks.length) await runTasks();
   flushImportContext_(ctx);
   return report;
 }
 
-/**
- * 1ファイルをページ単位でOCR。時間切れなら false（処理済ページを保存し、次回はその次のページから再開）
- */
-async function processReceiptFile_(ctx, file, entry, report) {
-  let pages;
+async function openReceiptPages_(ctx, file, entry, report) {
   try {
-    if (file.getMimeType() === "application/pdf") {
-      pages = await openPdfPages_(file.getBlob(), ctx.settings.pdfLibUrl);
-    } else {
-      const blob = file.getBlob();
-      pages = { count: 1, page: async () => blob };
-    }
+    const pages = file.getMimeType() === "application/pdf"
+      ? await openPdfPages_(file.getBlob(), ctx.settings.pdfLibUrl)
+      : (blob => ({ count: 1, page: async () => blob }))(file.getBlob());
+    entry.pages_total = pages.count;
+    ctx.files.touch(entry);
+    return pages;
   } catch (e) {
     entry.status = IMPORT_STATUS.ERROR;
     entry.message = "PDFを開けません: " + e.message;
     ctx.files.touch(entry);
     report.errors.push(entry.file_name + ": " + entry.message);
-    return true;
+    return null;
   }
-  entry.pages_total = pages.count;
-  const failed = String(entry.failed_pages || "").split(",").filter(Boolean);
+}
 
-  for (let p = Number(entry.pages_done || 0) + 1; p <= pages.count; p++) {
-    if (timeUp_(ctx)) {
-      ctx.files.touch(entry);
-      return false;
-    }
-    const tx = newReceiptTx_(entry, p, ctx.settings);
-    try {
-      const text = driveOcr_(await pages.page(p));
-      applyOcrResult_(tx, text);
-    } catch (e) {
+// 複数ページ（複数ファイル）をまとめてOCR。各ファイルの処理済ページを進め、最終ページで完了にする
+async function ocrReceiptTasks_(ctx, tasks, report) {
+  const blobs = [];
+  for (const t of tasks) blobs.push(await t.pages.page(t.p));
+  const results = driveOcrBatch_(blobs);
+  tasks.forEach((t, k) => {
+    const entry = t.entry;
+    const failed = String(entry.failed_pages || "").split(",").filter(Boolean);
+    const tx = newReceiptTx_(entry, t.p, ctx.settings);
+    const r = results[k] || { error: "結果なし" };
+    if (r.error) {
       tx.ocr_status = "失敗";
-      tx.ocr_note = "OCR失敗: " + e.message;
+      tx.ocr_note = "OCR失敗: " + r.error;
       tx.state = STATE.OCR_CHECK;
       tx.state_reason = tx.ocr_note;
-      failed.push(String(p));
+      failed.push(String(t.p));
       report.failedPages++;
+    } else {
+      applyOcrResult_(tx, r.text);
     }
     ctx.tx.insert(tx);
-    entry.pages_done = p;
+    entry.pages_done = t.p;
     entry.tx_count = Number(entry.tx_count || 0) + 1;
     entry.failed_pages = failed.join(",");
+    if (t.p >= t.pages.count) {
+      entry.status = IMPORT_STATUS.DONE;
+      entry.message = failed.length ? "OCR失敗ページ: " + failed.join(",") + "（「OCR失敗・エラーを再実行」で再試行）" : "";
+    }
     ctx.files.touch(entry);
     report.pages++;
-    if (p % 5 === 0) flushImportContext_(ctx);
-  }
-  entry.status = IMPORT_STATUS.DONE;
-  entry.message = failed.length ? "OCR失敗ページ: " + failed.join(",") + "（「OCR失敗・エラーを再実行」で再試行）" : "";
-  ctx.files.touch(entry);
-  return true;
+  });
 }
 
 function newReceiptTx_(entry, page, settings) {
@@ -1766,6 +1915,38 @@ function checkPhotoStatementTotals_(ctx) {
     out.push(k.replace(/\|/g, " ") + ": " + msg);
   });
   return out;
+}
+
+// ===== レシートの読み直し（読取ルールを更新したとき） =====
+// 取込済みのレシート原本を新しい処理版として読み直す。旧版の取引・判断は削除せず「旧版」として残す。
+
+function rereadReceipts_(targetMonth) {
+  const ctx = openImportContext_();
+  let n = 0;
+  const latest = {};
+  ctx.files.all().forEach(f => {
+    if (!latest[f.file_id] || Number(f.version) > Number(latest[f.file_id].version)) latest[f.file_id] = f;
+  });
+  Object.values(latest).filter(f => f.kind === KIND.RECEIPT && f.status === IMPORT_STATUS.DONE &&
+    (!targetMonth || toYm(f.target_month) === targetMonth)).forEach(f => {
+    f.status = IMPORT_STATUS.SUPERSEDED;
+    ctx.files.touch(f);
+    ctx.tx.all().filter(t => t.file_id === f.file_id && String(t.version) === String(f.version) && !isTrue_(t.superseded))
+      .forEach(t => {
+        t.superseded = true;
+        ctx.tx.touch(t);
+        logHistory_(ctx.hist, "取引", t.id, "旧版化", t.state, "", "レシートの読み直し");
+      });
+    const next = Object.assign({}, f, {
+      version: Number(f.version) + 1, status: IMPORT_STATUS.PROCESSING, message: "読み直し待ち",
+      pages_done: 0, failed_pages: "", tx_count: 0, imported_at: nowText_(),
+    });
+    delete next._i;
+    ctx.files.insert(next);
+    n++;
+  });
+  flushImportContext_(ctx);
+  return n;
 }
 
 // ===== OCR失敗ページ・エラーの再実行（当該ファイル・ページだけ） =====
@@ -2000,10 +2181,20 @@ function pendingDecisionCount_() {
   return n;
 }
 
+// 内容の指紋。前回と同じならシートを書き直さない（約20タブの再描画が遅いため）
+function viewSignature_(parts) {
+  const d = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, JSON.stringify(parts), Utilities.Charset.UTF_8);
+  return d.map(b => ((b + 256) % 256).toString(16).padStart(2, "0")).join("");
+}
+
 function writeView_(name, headers, rows, colors, color, opts) {
   const o = Object.assign({ decision: true, frozenCols: 3 }, opts || {});
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sh = ss.getSheetByName(name) || ss.insertSheet(name);
+  const props = PropertiesService.getDocumentProperties();
+  const sig = viewSignature_([headers, rows, colors, o, color]);
+  const existing = ss.getSheetByName(name);
+  if (existing && props.getProperty("view:" + name) === sig) return existing;
+  const sh = existing || ss.insertSheet(name);
   if (sh.getFilter()) sh.getFilter().remove();
   sh.clear();
   sh.getRange(1, 1, 1, headers.length).setValues([headers])
@@ -2012,7 +2203,8 @@ function writeView_(name, headers, rows, colors, color, opts) {
   sh.setFrozenColumns(o.frozenCols);
   if (rows.length) {
     const range = sh.getRange(2, 1, rows.length, headers.length);
-    range.setValues(rows.map(r => r.map((v, j) => (/原本$/.test(headers[j]) ? v : plainCell_(v)))));
+    range.setValues(rows.map(r => r.map((v, j) => (/原本$/.test(headers[j]) ? v
+      : (/^\d{4}-\d{2}$/.test(String(v)) ? asText_(v) : plainCell_(v))))));
     range.setBackgrounds(colors.map(c => headers.map(() => c)));
     if (o.decision) {
       const rule = SpreadsheetApp.newDataValidation()
@@ -2022,6 +2214,7 @@ function writeView_(name, headers, rows, colors, color, opts) {
     }
   }
   sh.getRange(1, 1, Math.max(rows.length, 1) + 1, headers.length).createFilter();
+  props.setProperty("view:" + name, sig);
   return sh;
 }
 
@@ -2203,7 +2396,12 @@ function applyDecisions_() {
 
   // 判断を入力できる全シート（突合結果・要確認一覧・先生＋カード別の突合結果・カード不明）
   const decisions = [];
-  decisionSheets_().forEach(sh => readDecisions_(sh).forEach(d => decisions.push(d)));
+  decisionSheets_().forEach(sh => {
+    const ds = readDecisions_(sh);
+    ds.forEach(d => decisions.push(d));
+    // 入力された判断は台帳へ移すので画面からは消す（反映できなかったものはアラートで再入力を促す）
+    if (ds.length) sh.getRange(2, 1, sh.getLastRow() - 1, 2).clearContent();
+  });
   const done = new Set();
 
   decisions.forEach(d => {
@@ -2381,6 +2579,7 @@ function onOpen() {
     .addItem("手動紐付け（1対多・多対1）", "menuManualLink")
     .addItem("取引を分割（1ページ複数レシート）", "menuSplitTx")
     .addItem("OCR失敗・エラーを再実行", "menuRetry")
+    .addItem("レシートを読み直す（読取ルール更新後）", "menuReread")
     .addSeparator()
     .addItem("【初回】V8シート作成", "menuInit")
     .addToUi();
@@ -2534,6 +2733,17 @@ function menuRetry() {
       "OCR再実行: " + rep.pages + "ページ（成功 " + rep.fixed + "）\n" +
       "エラーファイル: " + rep.files + "件を再処理待ちにしました（①または②を実行してください）" +
       listText_("⚠️", rep.errors) + "\n\n【突合状態】\n" + summaryText_(r));
+  });
+}
+
+function menuReread() {
+  return guarded_("レシートを読み直す", async ui => {
+    const res = ui.prompt("レシートを読み直す",
+      "対象月を入力（例 2026-08）。空欄なら取込済みのレシートすべて。\n今の読取結果・判断は削除せず「旧版」として残ります。", ui.ButtonSet.OK_CANCEL);
+    if (res.getSelectedButton() !== ui.Button.OK) return;
+    const month = toYm(res.getResponseText());
+    const n = rereadReceipts_(month);
+    ui.alert("✅ " + n + "件のレシートを読み直し待ちにしました。\n「① レシート読込」を実行してください（時間切れで止まったら、もう一度実行すると続きから再開します）。");
   });
 }
 

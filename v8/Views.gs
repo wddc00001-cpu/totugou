@@ -72,10 +72,20 @@ function pendingDecisionCount_() {
   return n;
 }
 
+// 内容の指紋。前回と同じならシートを書き直さない（約20タブの再描画が遅いため）
+function viewSignature_(parts) {
+  const d = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, JSON.stringify(parts), Utilities.Charset.UTF_8);
+  return d.map(b => ((b + 256) % 256).toString(16).padStart(2, "0")).join("");
+}
+
 function writeView_(name, headers, rows, colors, color, opts) {
   const o = Object.assign({ decision: true, frozenCols: 3 }, opts || {});
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sh = ss.getSheetByName(name) || ss.insertSheet(name);
+  const props = PropertiesService.getDocumentProperties();
+  const sig = viewSignature_([headers, rows, colors, o, color]);
+  const existing = ss.getSheetByName(name);
+  if (existing && props.getProperty("view:" + name) === sig) return existing;
+  const sh = existing || ss.insertSheet(name);
   if (sh.getFilter()) sh.getFilter().remove();
   sh.clear();
   sh.getRange(1, 1, 1, headers.length).setValues([headers])
@@ -84,7 +94,8 @@ function writeView_(name, headers, rows, colors, color, opts) {
   sh.setFrozenColumns(o.frozenCols);
   if (rows.length) {
     const range = sh.getRange(2, 1, rows.length, headers.length);
-    range.setValues(rows.map(r => r.map((v, j) => (/原本$/.test(headers[j]) ? v : plainCell_(v)))));
+    range.setValues(rows.map(r => r.map((v, j) => (/原本$/.test(headers[j]) ? v
+      : (/^\d{4}-\d{2}$/.test(String(v)) ? asText_(v) : plainCell_(v))))));
     range.setBackgrounds(colors.map(c => headers.map(() => c)));
     if (o.decision) {
       const rule = SpreadsheetApp.newDataValidation()
@@ -94,6 +105,7 @@ function writeView_(name, headers, rows, colors, color, opts) {
     }
   }
   sh.getRange(1, 1, Math.max(rows.length, 1) + 1, headers.length).createFilter();
+  props.setProperty("view:" + name, sig);
   return sh;
 }
 

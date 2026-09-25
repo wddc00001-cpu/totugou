@@ -152,7 +152,7 @@ function flushImportContext_(ctx) {
 }
 
 function timeUp_(ctx) {
-  return Date.now() - ctx.started > ctx.settings.timeBudgetMs;
+  return Date.now() - ctx.started > ctx.settings.timeBudgetMs - ctx.settings.reserveMs;
 }
 
 // ===== ① レシート読込（ページ単位OCR） =====
@@ -160,7 +160,17 @@ function timeUp_(ctx) {
 async function importReceipts_() {
   const ctx = openImportContext_();
   const report = { files: 0, pages: 0, failedPages: 0, classify: 0, errors: [], interrupted: false, folderErrors: [] };
+  const batchSize = Math.max(1, ctx.settings.ocrBatch);
+  let tasks = [];
 
+  const runTasks = async () => {
+    if (!tasks.length) return;
+    await ocrReceiptTasks_(ctx, tasks, report);
+    tasks = [];
+    flushImportContext_(ctx);
+  };
+
+  outer:
   for (const item of listSourceFiles_(KIND.RECEIPT)) {
     if (item.folderError) { report.folderErrors.push(item.folderError); continue; }
     if (!RECEIPT_MIMES.includes(item.file.getMimeType())) continue;
@@ -169,65 +179,69 @@ async function importReceipts_() {
     if (reg.entry.status === IMPORT_STATUS.CLASSIFY && reg.action === "skip") report.classify++;
     if (reg.action !== "process") continue;
     report.files++;
-    const done = await processReceiptFile_(ctx, item.file, reg.entry, report);
-    flushImportContext_(ctx);
-    if (!done) { report.interrupted = true; break; }
+    const pages = await openReceiptPages_(ctx, item.file, reg.entry, report);
+    if (!pages) continue;
+    for (let p = Number(reg.entry.pages_done || 0) + 1; p <= pages.count; p++) {
+      tasks.push({ entry: reg.entry, pages, p });
+      if (tasks.length >= batchSize) {
+        await runTasks();
+        if (timeUp_(ctx)) { report.interrupted = true; break outer; }
+      }
+    }
   }
+  if (!report.interrupted || tasks.length) await runTasks();
   flushImportContext_(ctx);
   return report;
 }
 
-/**
- * 1ファイルをページ単位でOCR。時間切れなら false（処理済ページを保存し、次回はその次のページから再開）
- */
-async function processReceiptFile_(ctx, file, entry, report) {
-  let pages;
+async function openReceiptPages_(ctx, file, entry, report) {
   try {
-    if (file.getMimeType() === "application/pdf") {
-      pages = await openPdfPages_(file.getBlob(), ctx.settings.pdfLibUrl);
-    } else {
-      const blob = file.getBlob();
-      pages = { count: 1, page: async () => blob };
-    }
+    const pages = file.getMimeType() === "application/pdf"
+      ? await openPdfPages_(file.getBlob(), ctx.settings.pdfLibUrl)
+      : (blob => ({ count: 1, page: async () => blob }))(file.getBlob());
+    entry.pages_total = pages.count;
+    ctx.files.touch(entry);
+    return pages;
   } catch (e) {
     entry.status = IMPORT_STATUS.ERROR;
     entry.message = "PDFを開けません: " + e.message;
     ctx.files.touch(entry);
     report.errors.push(entry.file_name + ": " + entry.message);
-    return true;
+    return null;
   }
-  entry.pages_total = pages.count;
-  const failed = String(entry.failed_pages || "").split(",").filter(Boolean);
+}
 
-  for (let p = Number(entry.pages_done || 0) + 1; p <= pages.count; p++) {
-    if (timeUp_(ctx)) {
-      ctx.files.touch(entry);
-      return false;
-    }
-    const tx = newReceiptTx_(entry, p, ctx.settings);
-    try {
-      const text = driveOcr_(await pages.page(p));
-      applyOcrResult_(tx, text);
-    } catch (e) {
+// 複数ページ（複数ファイル）をまとめてOCR。各ファイルの処理済ページを進め、最終ページで完了にする
+async function ocrReceiptTasks_(ctx, tasks, report) {
+  const blobs = [];
+  for (const t of tasks) blobs.push(await t.pages.page(t.p));
+  const results = driveOcrBatch_(blobs);
+  tasks.forEach((t, k) => {
+    const entry = t.entry;
+    const failed = String(entry.failed_pages || "").split(",").filter(Boolean);
+    const tx = newReceiptTx_(entry, t.p, ctx.settings);
+    const r = results[k] || { error: "結果なし" };
+    if (r.error) {
       tx.ocr_status = "失敗";
-      tx.ocr_note = "OCR失敗: " + e.message;
+      tx.ocr_note = "OCR失敗: " + r.error;
       tx.state = STATE.OCR_CHECK;
       tx.state_reason = tx.ocr_note;
-      failed.push(String(p));
+      failed.push(String(t.p));
       report.failedPages++;
+    } else {
+      applyOcrResult_(tx, r.text);
     }
     ctx.tx.insert(tx);
-    entry.pages_done = p;
+    entry.pages_done = t.p;
     entry.tx_count = Number(entry.tx_count || 0) + 1;
     entry.failed_pages = failed.join(",");
+    if (t.p >= t.pages.count) {
+      entry.status = IMPORT_STATUS.DONE;
+      entry.message = failed.length ? "OCR失敗ページ: " + failed.join(",") + "（「OCR失敗・エラーを再実行」で再試行）" : "";
+    }
     ctx.files.touch(entry);
     report.pages++;
-    if (p % 5 === 0) flushImportContext_(ctx);
-  }
-  entry.status = IMPORT_STATUS.DONE;
-  entry.message = failed.length ? "OCR失敗ページ: " + failed.join(",") + "（「OCR失敗・エラーを再実行」で再試行）" : "";
-  ctx.files.touch(entry);
-  return true;
+  });
 }
 
 function newReceiptTx_(entry, page, settings) {
@@ -452,6 +466,38 @@ function checkPhotoStatementTotals_(ctx) {
     out.push(k.replace(/\|/g, " ") + ": " + msg);
   });
   return out;
+}
+
+// ===== レシートの読み直し（読取ルールを更新したとき） =====
+// 取込済みのレシート原本を新しい処理版として読み直す。旧版の取引・判断は削除せず「旧版」として残す。
+
+function rereadReceipts_(targetMonth) {
+  const ctx = openImportContext_();
+  let n = 0;
+  const latest = {};
+  ctx.files.all().forEach(f => {
+    if (!latest[f.file_id] || Number(f.version) > Number(latest[f.file_id].version)) latest[f.file_id] = f;
+  });
+  Object.values(latest).filter(f => f.kind === KIND.RECEIPT && f.status === IMPORT_STATUS.DONE &&
+    (!targetMonth || toYm(f.target_month) === targetMonth)).forEach(f => {
+    f.status = IMPORT_STATUS.SUPERSEDED;
+    ctx.files.touch(f);
+    ctx.tx.all().filter(t => t.file_id === f.file_id && String(t.version) === String(f.version) && !isTrue_(t.superseded))
+      .forEach(t => {
+        t.superseded = true;
+        ctx.tx.touch(t);
+        logHistory_(ctx.hist, "取引", t.id, "旧版化", t.state, "", "レシートの読み直し");
+      });
+    const next = Object.assign({}, f, {
+      version: Number(f.version) + 1, status: IMPORT_STATUS.PROCESSING, message: "読み直し待ち",
+      pages_done: 0, failed_pages: "", tx_count: 0, imported_at: nowText_(),
+    });
+    delete next._i;
+    ctx.files.insert(next);
+    n++;
+  });
+  flushImportContext_(ctx);
+  return n;
 }
 
 // ===== OCR失敗ページ・エラーの再実行（当該ファイル・ページだけ） =====

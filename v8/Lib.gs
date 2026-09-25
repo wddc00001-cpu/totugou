@@ -121,8 +121,17 @@ function monthOf(ymd) {
   return ymd ? ymd.slice(0, 7) : "";
 }
 
+// 対象月の正規化: シートが「2026-08」を日付に自動変換しても "2026-08" に戻す
+function toYm(v) {
+  if (isBlank_(v)) return "";
+  if (isDate_(v)) return v.getFullYear() + "-" + pad2_(v.getMonth() + 1);
+  const s = nfkc_(v).trim().replace(/^'/, "");
+  const m = s.match(/^(\d{4})[-\/年.](\d{1,2})/);
+  return m ? m[1] + "-" + pad2_(Number(m[2])) : s;
+}
+
 function addMonths(ym, n) {
-  const [y, m] = ym.split("-").map(Number);
+  const [y, m] = toYm(ym).split("-").map(Number);
   const t = y * 12 + (m - 1) + n;
   return Math.floor(t / 12) + "-" + pad2_((t % 12) + 1);
 }
@@ -427,7 +436,8 @@ function detectCurrency_(text) {
 
 function parseReceiptText(text) {
   const r = { date: "", amount: "", currency: "JPY", merchant: "", notes: [] };
-  const s = nfkc_(text);
+  // OCR で「26, 290」「1. 400」のように区切りの後に空白が入るのを詰める
+  const s = nfkc_(text).replace(/(\d)([,.])\s+(\d{3})(?!\d)/g, "$1$2$3");
   if (!s.trim()) { r.notes.push("OCRテキストが空です"); return r; }
   const lines = s.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
@@ -455,9 +465,20 @@ function parseReceiptText(text) {
     const v = nums.length ? nums[nums.length - 1] : NaN;
     if (v > 0 && !totals.some(t => sameAmount_(t, v))) totals.push(v);
   });
+  // 領収書の金額表記「¥11,990-」「¥11,990.-」
+  const receiptMarks = [];
+  const reMark = /[¥￥\\]\s*(\d{1,3}(?:,\d{3})+|\d+)\s*(?:\.-|-|ー|―)(?!\d)/g;
+  let mk;
+  while ((mk = reMark.exec(s))) {
+    const v = Number(mk[1].replace(/,/g, ""));
+    if (v > 0 && !receiptMarks.includes(v)) receiptMarks.push(v);
+  }
   if (totals.length === 1) r.amount = totals[0];
   else if (totals.length > 1) {
     r.notes.push("複数の合計金額を検出: " + totals.join(" / ") + "（1ページに複数レシートの可能性。自動で選びません）");
+  } else if (receiptMarks.length === 1) {
+    r.amount = receiptMarks[0];
+    r.notes.push("領収書の金額表記（¥…-）を採用");
   } else {
     const yen = [];
     const re = /[¥￥]\s*(\d{1,3}(?:,\d{3})+|\d+)|(\d{1,3}(?:,\d{3})+|\d+)\s*円/g;
@@ -466,7 +487,7 @@ function parseReceiptText(text) {
       const v = Number((m[1] || m[2]).replace(/,/g, ""));
       if (v > 0 && !yen.includes(v)) yen.push(v);
     }
-    if (yen.length === 1 && r.currency === "JPY") {
+    if (yen.length === 1 && yen[0] >= 100 && r.currency === "JPY") {
       r.amount = yen[0];
       r.notes.push("合計行なし（金額表記が1つのみのため採用）");
     } else {
@@ -478,8 +499,29 @@ function parseReceiptText(text) {
     r.notes.push("通貨が確定できないため金額は空欄");
   }
 
-  // 日付
+  // 1枚に複数のレシートが写っていないか（日付・時刻・登録番号・金額表記が複数）
   const dates = findDates(s);
+  const times = [];
+  const reTime = /(?<![\d:])([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?(?![\d:])/g;
+  let tm;
+  while ((tm = reTime.exec(s))) { const k = Number(tm[1]) + ":" + tm[2]; if (!times.includes(k)) times.push(k); }
+  const regNos = [];
+  (s.match(/T\d{13}/g) || []).forEach(x => { if (!regNos.includes(x)) regNos.push(x); });
+  const hints = [];
+  if (dates.length > 1) hints.push("日付" + dates.length + "件");
+  if (times.length > 1) hints.push("時刻" + times.length + "件");
+  if (regNos.length > 1) hints.push("登録番号" + regNos.length + "件");
+  if (receiptMarks.length > 1) hints.push("領収金額" + receiptMarks.length + "件");
+  if (r.amount !== "" && totals.length <= 1 && receiptMarks.length === 1) {
+    const other = yenAmounts_(s).filter(v => v !== r.amount && !isTaxPartOf_(v, r.amount, s));
+    if (other.length) hints.push("別の金額 ¥" + other.slice(0, 3).map(v => v.toLocaleString("ja-JP")).join("・¥"));
+  }
+  if (hints.length && r.amount !== "") {
+    r.amount = "";
+    r.notes.push("1枚に複数のレシートが写っている可能性（" + hints.join("・") + "）。1枚ずつ撮影・スキャンするか「取引を分割」で入力");
+  }
+
+  // 日付
   if (dates.length) {
     r.date = dates[0];
     if (dates.length > 1) r.notes.push("複数の日付を検出: " + dates.map(fmtYmdJa).join(" / ") + "（先頭を採用）");
@@ -492,6 +534,29 @@ function parseReceiptText(text) {
     !/^[\d\s,.:¥￥$\-*#()]+$/.test(l) && !/(tel|電話|http|www\.)/i.test(l)
   ) || "").slice(0, 60);
   return r;
+}
+
+function yenAmounts_(s) {
+  const out = [];
+  const re = /[¥￥]\s*(\d{1,3}(?:,\d{3})+|\d+)/g;
+  let m;
+  while ((m = re.exec(s))) {
+    const v = Number(m[1].replace(/,/g, ""));
+    if (v > 0 && !out.includes(v)) out.push(v);
+  }
+  return out;
+}
+
+// 合計に付随する金額（税抜対象額・消費税・小計・0円のお釣り等）か
+function isTaxPartOf_(v, total, s) {
+  if (v >= total) return false;
+  const rest = total - v;
+  const all = yenAmounts_(s).concat((s.match(/\d{1,3}(?:,\d{3})+/g) || []).map(x => Number(x.replace(/,/g, ""))));
+  if (all.includes(rest)) return true;                        // 税抜額＋消費税＝合計
+  const rate = v / total;
+  if (Math.abs(rate - 10 / 110) < 0.002 || Math.abs(rate - 8 / 108) < 0.002) return true;   // 内消費税
+  if (Math.abs(v - Math.round(total / 1.1)) <= 1 || Math.abs(v - Math.round(total / 1.08)) <= 1) return true;   // 税抜対象額
+  return false;
 }
 
 // カード番号など12〜19桁の数字列を末尾4桁以外マスク

@@ -15,6 +15,7 @@ function onOpen() {
     .addItem("手動紐付け（1対多・多対1）", "menuManualLink")
     .addItem("取引を分割（1ページ複数レシート）", "menuSplitTx")
     .addItem("OCR失敗・エラーを再実行", "menuRetry")
+    .addItem("レシートを読み直す（読取ルール更新後）", "menuReread")
     .addSeparator()
     .addItem("【初回】V8シート作成", "menuInit")
     .addToUi();
@@ -168,6 +169,17 @@ function menuRetry() {
       "OCR再実行: " + rep.pages + "ページ（成功 " + rep.fixed + "）\n" +
       "エラーファイル: " + rep.files + "件を再処理待ちにしました（①または②を実行してください）" +
       listText_("⚠️", rep.errors) + "\n\n【突合状態】\n" + summaryText_(r));
+  });
+}
+
+function menuReread() {
+  return guarded_("レシートを読み直す", async ui => {
+    const res = ui.prompt("レシートを読み直す",
+      "対象月を入力（例 2026-08）。空欄なら取込済みのレシートすべて。\n今の読取結果・判断は削除せず「旧版」として残ります。", ui.ButtonSet.OK_CANCEL);
+    if (res.getSelectedButton() !== ui.Button.OK) return;
+    const month = toYm(res.getResponseText());
+    const n = rereadReceipts_(month);
+    ui.alert("✅ " + n + "件のレシートを読み直し待ちにしました。\n「① レシート読込」を実行してください（時間切れで止まったら、もう一度実行すると続きから再開します）。");
   });
 }
 

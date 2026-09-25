@@ -36,12 +36,66 @@ function trashQuietly_(id) {
 
 // 画像・1ページPDF → OCRテキスト（Drive OCR。外部AIには送信しない）
 function driveOcr_(blob) {
-  const id = uploadConverted_(blob, "application/vnd.google-apps.document", "&ocrLanguage=ja");
+  const r = driveOcrBatch_([blob])[0];
+  if (r.error) throw new Error(r.error);
+  return r.text;
+}
+
+function multipartRequest_(blob, googleMime, extraQuery) {
+  const boundary = "wada_v8_" + Utilities.getUuid();
+  const meta = JSON.stringify({ name: "v8_tmp_" + Date.now(), mimeType: googleMime });
+  const head =
+    "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + meta +
+    "\r\n--" + boundary + "\r\nContent-Type: " + blob.getContentType() + "\r\n\r\n";
+  const tail = "\r\n--" + boundary + "--";
+  return {
+    url: "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id" + (extraQuery || ""),
+    method: "post",
+    contentType: "multipart/related; boundary=" + boundary,
+    payload: Utilities.newBlob(head).getBytes().concat(blob.getBytes()).concat(Utilities.newBlob(tail).getBytes()),
+    headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+    muteHttpExceptions: true,
+  };
+}
+
+/**
+ * 複数の画像・1ページPDFをまとめてOCR（アップロード・テキスト取得・一時ファイル削除を並列実行）
+ * @return [{ text } | { error }]（入力と同じ順）
+ */
+function driveOcrBatch_(blobs) {
+  if (!blobs.length) return [];
+  const auth = { Authorization: "Bearer " + ScriptApp.getOAuthToken() };
+  const out = blobs.map(() => ({}));
+  const ups = UrlFetchApp.fetchAll(blobs.map(b => multipartRequest_(b, "application/vnd.google-apps.document", "&ocrLanguage=ja")));
+  const ids = ups.map((res, i) => {
+    if (res.getResponseCode() >= 300) {
+      out[i].error = "Drive OCR 失敗 HTTP " + res.getResponseCode() + " " + res.getContentText().slice(0, 120);
+      return "";
+    }
+    return JSON.parse(res.getContentText()).id;
+  });
+  const live = ids.map((id, i) => ({ id, i })).filter(x => x.id);
   try {
-    return DocumentApp.openById(id).getBody().getText();
+    const texts = UrlFetchApp.fetchAll(live.map(x => ({
+      url: "https://www.googleapis.com/drive/v3/files/" + x.id + "/export?mimeType=text/plain",
+      headers: auth, muteHttpExceptions: true,
+    })));
+    texts.forEach((res, k) => {
+      const i = live[k].i;
+      if (res.getResponseCode() >= 300) out[i].error = "OCRテキスト取得失敗 HTTP " + res.getResponseCode();
+      else out[i].text = res.getContentText("UTF-8").replace(/^\uFEFF/, "");
+    });
   } finally {
-    trashQuietly_(id);
+    // 一時ドキュメントは成功・失敗にかかわらずゴミ箱へ
+    try {
+      UrlFetchApp.fetchAll(live.map(x => ({
+        url: "https://www.googleapis.com/drive/v3/files/" + x.id, method: "patch",
+        contentType: "application/json", payload: JSON.stringify({ trashed: true }),
+        headers: auth, muteHttpExceptions: true,
+      })));
+    } catch (_) {}
   }
+  return out;
 }
 
 // xlsx → 2次元配列（Date はそのまま Date で返る）

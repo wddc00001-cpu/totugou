@@ -91,7 +91,10 @@ class Table {
 
   toObj_(v, i) {
     const o = { _i: i };
-    this.fields.forEach(([key]) => { o[key] = v[this.col[key]]; });
+    this.fields.forEach(([key]) => {
+      const x = v[this.col[key]];
+      o[key] = MONTH_KEYS_.includes(key) ? toYm(x) : x;
+    });
     return o;
   }
 
@@ -115,7 +118,7 @@ class Table {
     const v = base ? base.slice() : new Array(this.width).fill("");
     this.fields.forEach(([key]) => {
       const x = o[key];
-      v[this.col[key]] = x === undefined || x === null ? "" : plainCell_(x);
+      v[this.col[key]] = x === undefined || x === null ? "" : (TEXT_KEYS_.includes(key) ? asText_(x) : plainCell_(x));
     });
     return v;
   }
@@ -143,6 +146,15 @@ class Table {
       this.added = [];
     }
   }
+}
+
+// シートに自動変換させたくない列（月・ハッシュ）は文字として書き込む
+const MONTH_KEYS_ = ["target_month", "next_check_month"];
+const TEXT_KEYS_ = MONTH_KEYS_.concat(["content_hash"]);
+
+function asText_(v) {
+  const s = String(v);
+  return s === "" || s.charAt(0) === "'" ? s : "'" + s;
 }
 
 // OCR・CSV 由来の文字列が「=」で始まっても数式として評価させない
@@ -181,6 +193,8 @@ function loadSettings_() {
     dateWindow:    num("日付要確認の検出幅(日)", 45),
     graceMonths:   num("翌月確認の猶予(月)", 1),
     timeBudgetMs:  num("処理時間上限(秒)", 270) * 1000,
+    reserveMs:     num("画面更新の予備時間(秒)", 90) * 1000,
+    ocrBatch:      num("OCR同時処理数", 6),
     downloadPattern: String(isBlank_(map["ダウンロード判定キーワード"])
       ? DEFAULT_SETTINGS.find(r => r[0] === "ダウンロード判定キーワード")[1] : map["ダウンロード判定キーワード"]),
     pdfLibUrl:     String(map["pdf-lib URL"] || DEFAULT_SETTINGS.find(r => r[0] === "pdf-lib URL")[1]),
